@@ -79,17 +79,40 @@ pub fn self_test() -> Result<(), String> {
         Command::Give {
             template: "Bad;Command".into(),
             quantity: 1,
+            options: dd_protocol::ItemOptions::default(),
         },
     ))?;
     if !matches!(invalid.result, Err(ref e) if e.code == ErrorCode::InvalidRequest) {
         return Err("Invalid request was not rejected.".into());
     }
     println!("PASS: invalid item request rejected");
+    let mut custom = dd_protocol::CustomItem::default();
+    custom.weapon.projectiles = Some(129);
+    for options in [
+        dd_protocol::ItemOptions::RandomRoll { strength: 0.0 },
+        dd_protocol::ItemOptions::Custom {
+            settings: Box::new(custom),
+        },
+    ] {
+        let response = host.send(Request::new(
+            6,
+            Command::Give {
+                template: "Package.Item".into(),
+                quantity: 1,
+                options,
+            },
+        ))?;
+        if !matches!(response.result, Err(ref e) if e.code == ErrorCode::InvalidRequest) {
+            return Err("Invalid item settings were not rejected.".into());
+        }
+    }
+    println!("PASS: invalid random/custom settings rejected by the real adapter DLL");
     let grant = host.send(Request::new(
         3,
         Command::Give {
             template: "Package.Item".into(),
             quantity: 1,
+            options: dd_protocol::ItemOptions::default(),
         },
     ))?;
     if !matches!(grant.result, Err(ref e) if e.code == ErrorCode::IntegrationUnavailable) {

@@ -48,7 +48,11 @@ pub fn handle(request: Request) -> Response {
     } else {
         match request.command {
             Command::Status {} | Command::Shutdown {} => Ok(status()),
-            Command::Give { template, quantity } => match validate_grant(&template, quantity) {
+            Command::Give {
+                template,
+                quantity,
+                options,
+            } => match validate_grant(&template, quantity).and_then(|()| options.validate()) {
                 Err(message) => rejection(ErrorCode::InvalidRequest, message),
                 Ok(()) => rejection(
                     ErrorCode::IntegrationUnavailable,
@@ -114,6 +118,7 @@ mod tests {
             Command::Give {
                 template: "Package.Item".into(),
                 quantity: 1,
+                options: dd_protocol::ItemOptions::default(),
             },
         ));
         assert_eq!(response.id, 7);
@@ -141,6 +146,7 @@ mod tests {
             Command::Give {
                 template: "A.B".into(),
                 quantity: 0,
+                options: dd_protocol::ItemOptions::default(),
             },
         ));
         assert_eq!(response.result.unwrap_err().code, ErrorCode::InvalidRequest);

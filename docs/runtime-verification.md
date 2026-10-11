@@ -23,7 +23,8 @@ addresses borrowed from another game or version.
 
 The x86 dispatcher uses `thiscall`: ECX is the object, with function, parameters,
 and result/null on the stack; it returns with `ret 12`. The adapter calls only
-the verified manager dispatcher and requires the same vtable target.
+the verified UObject dispatcher on the manager or equipment archetype, requiring
+the same vtable target.
 
 Core offsets were confirmed with native instructions and live reflection:
 object index 0x04, flags 0x08, outer 0x28, name 0x2C, class 0x34, archetype 0x38;
@@ -36,7 +37,8 @@ offsets come from reflection rather than hard-coded instance layouts.
 
 The adapter calls the script function
 `UDKGame.DunDefHeroManager.ServerCreateDroppedEquipment` with a selected packaged
-archetype, the local pawn, quality zero, and `useEquipmentObjectAsTemplate=true`.
+archetype and the local pawn. Template mode passes quality zero; random mode
+passes the selected positive strength. Both set `useEquipmentObjectAsTemplate=true`.
 Its reflected parameter buffer is 68 bytes, with the returned actor at byte 64.
 All 13 parameter names, types, dimensions, sizes and offsets are checked before
 dispatch. Optional values are explicit, including `remoteUserID=-2`.
@@ -52,7 +54,8 @@ Startup_INT.upk (SHA-256
 `00656c92c2ad74769210ad914137d93444773057f6d7a3130171e85d42b41568`). The UI lists
 592 weapon/armor references whose types were read in the local tavern: 562 weapon
 and 30 armor variants. These counts are reference variants, not unique marketed
-items. Only the two examples below were actually spawned in this verification.
+items. The live checks below cover representative weapons and armor, not the
+whole catalog.
 
 ## Verified behavior
 
@@ -71,15 +74,66 @@ The first live connection refused an array with one player and capacity 17. The
 validation now bounds capacity at 128 while requiring exactly one active player;
 it does not equate allocation capacity with active player count.
 
+## Custom item creation (v0.2)
+
+The adapter builds the 412-byte EquipmentNetInfo in caller-owned memory using
+reflected template properties and the game's signed-value encoding. It calls
+`HeroEquipment.CreateEquipmentFromNetInfo`: function flags 0x426002, native index
+0, parameters 428 bytes, return pointer at 424. The input structure at 0 is const
+out (property flags 0x400182); ownerHero 412, AltOwnerObject 416, fromDroppedEquipment 420.
+All structure/property types, dimensions, offsets, sizes, object targets and
+boolean masks are checked against the inspected build on attachment.
+
+FString headers borrow unchanged template-owned storage during this synchronous
+const-out call. Native ProcessEvent analysis established that its out-parameter
+handling does not destroy this caller buffer. InitFromNetInfo makes the owning
+copies in the new object. Rust neither owns nor frees Unreal string allocations.
+The temporary item is created and passed to spawning in one game-thread callback,
+with no frame retention or asynchronous work in between.
+
+The temporary is spawned with quality 0 and useEquipmentObjectAsTemplate=false.
+This preserves the original packaged archetype for serialization. Quality and
+stats are final before the dropped actor initializes colors, floor categories and
+counters. No shared template or existing inventory item is modified. Creation
+assigns a fresh ID pair; the final pickup preserves that pair. Success requires
+readback of every requested custom value on both the temporary and final item.
+
+Quality indices 0–12 are in reverse rarity order (Godly through Cursed); 13–19 are
+Mythical, Transcendent, Supreme, Ultimate, Ultimate93, Ultimate+, Ultimate++.
+Hero stat indices 1–10 are exposed; unused index 0 is preserved. Armor resistance
+slots are matched by damage class, not assumed positional order. Signed-byte
+weapon bonuses encode as value+127 and roundtrip only in −127–128. Hero bonuses
+use int32 storage with the same offset, not byte storage. Minimum damage and
+maximum-upgrade requirements are template-specific and checked before creation.
+
+Live tests on 2026-10-11 created four pickups:
+
+- Custom Sword of Embers: Mythical, upgrades 1/300, damage bonus 12345, elemental
+  damage 2345, knockback 12, hero health 321, hero damage 234, defense damage 456.
+- Custom pristine helmet: Ultimate+, upgrades 1/444, ten explicit hero/defense
+  bonuses; physical/fire/lightning/poison resistances 42/33/24/15.
+- Random pristine helmet at strength 2.0: produced Legendary quality, 20 maximum
+  upgrades, randomized stats and resistances.
+- Template-default pristine helmet: Torn quality, 6 maximum upgrades and unchanged
+  template stats.
+
+An independent process-memory reader confirmed exact custom values, original
+archetypes, fresh IDs, and byte-for-byte unchanged template native properties.
+A later independent scan found both custom items in the manager's ItemBoxEquipments
+array with new instance identities and the same IDs, quality, stats and upgrades.
+This verifies pickup/serialization into the item box. It does not establish
+save/reload persistence. The pickups had already been collected, so a separate
+live readback of floor category membership was unavailable.
+
 ## Limits
 
 Only this executable build is supported. Unknown builds, online/ranked sessions,
 multiple local players, loading/hero-swap states, invalid templates and changed
 ABIs are rejected. Each mutation rechecks session ownership and mode.
 
-Spawns use archetype defaults. Stat/quality editing, loading absent packages,
-direct inventory insertion, and save/reload persistence are not implemented or
-verified. The game handles ordinary pickup and saves. No automatic retry follows
+Loading absent packages and direct inventory insertion are not implemented.
+Save/reload persistence has not yet been verified. The game handles ordinary
+pickup and saves. No automatic retry follows
 an ambiguous operation result. Not every catalog entry has been spawned.
 
 The adapter DLL is pinned until game exit to prevent a callback or worker from

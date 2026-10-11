@@ -3,11 +3,13 @@
 A small Rust overlay and native adapter for experimenting with equipment in
 Dungeon Defenders single-player.
 
-**Status: working single-player preview for Steam build 25809881.** Choose
+**Status: v0.2 single-player preview for Steam build 25809881.** Choose
 equipment and spawn it beside your hero, then pick it up normally. The weapon
 and armor spawn path was verified in a regular tavern, including user-confirmed
 pickup. The catalog contains 592 weapon/armor references; not every entry has
-been individually tested. Items use their template's default stats.
+been individually tested. Choose template defaults, a game-generated random roll,
+or custom quality and stat overrides. Custom weapon and armor values have been
+read back after normal pickup into the item box.
 
 ## Run the preview
 
@@ -15,8 +17,31 @@ been individually tested. Items use their template's default stats.
 2. Start Dungeon Defenders and enter a regular **local single-player** map/tavern.
 3. Run `dd-overlay.exe` and click **Connect to game**. The first connection briefly
    pauses gameplay while inspecting reflection metadata.
-4. Search/select equipment, choose quantity, and click **Spawn pickup**. Pick it
-   up in-game to equip or store it. Normal game saves can retain picked-up items.
+4. Search/select equipment and choose **Template defaults**, **Random roll**, or
+   **Custom**. Choose quantity and click **Spawn pickup**.
+5. Pick it up in-game to equip or store it. Collected items appear in your item
+   box. Normal game saves can retain picked-up items.
+
+In **Random roll**, strength 0.01–2.0 is the game's randomizer input. It does not
+force a named rarity: template settings, mission difficulty and map multipliers
+still apply. Some templates keep a fixed quality or disable randomization.
+
+In **Custom**, select a quality or keep **Template**, then check only the fields
+you want to override. Unchecked values remain inherited. Hero/defense bonuses,
+armor resistances, weapon bonuses and upgrade counts are supported. Weapon
+controls are **bonuses**, not final displayed totals; a weapon may not use every
+bonus. Elemental damage keeps the template's element. Special items can retain
+their fixed name and beam color even with a different quality tier.
+
+The editor bounds hero bonuses to ±9999, damage/ammo to 0–1000000, projectile
+speed bonus to ±1000000, resistances to 0–100, and upgrades to 1–9999. These are
+tool limits, not normal loot caps. Small weapon bonuses are limited to −127–128
+because larger values wrap in the game's serialization. The adapter also checks
+template minimum damage/upgrades and rejects a current level above the maximum.
+Leave both upgrade fields unchecked to preserve template defaults.
+
+This release uses protocol version 2. Keep the three matching binaries together;
+restart the game before replacing an older attached adapter.
 
 **Run isolated adapter test** is a separate diagnostic; it never connects to the
 game or creates equipment. **Check** only inspects the installation.
@@ -82,7 +107,8 @@ stalled clients against the real DLL using `scripts/transport-test.ps1`.
 - `crates/overlay`: egui/eframe window, equipment search, game identification and
   helper lifecycle. Connections and requests run outside the UI thread.
 - `crates/protocol`: concrete versioned messages and Windows named-pipe transport.
-  Requests contain semantic item paths and quantities, never game pointers.
+  Requests contain semantic item paths, quantities and typed item options, never
+  game pointers.
 - `crates/adapter`: build validation, a thread-specific Windows message hook,
   reflected engine bindings, local-session guards and confirmed pickup creation.
 
@@ -101,7 +127,8 @@ command execution or memory-write operation.
 ## Current limits
 
 - Supports one local player on the verified Windows x86 game build.
-- Creates floor pickups with template stats; no custom stat/quality editing.
+- Creates floor pickups with defaults, random rolls, or explicit custom overrides.
+- Custom mode starts from template defaults; it does not reroll before applying overrides.
 - No direct inventory insertion, package loading, pets or accessories.
 - Save/reload persistence and every catalog variant have not been tested.
 - After an uncertain response, inspect nearby pickups before trying again.

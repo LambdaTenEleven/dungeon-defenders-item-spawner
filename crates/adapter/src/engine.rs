@@ -1,6 +1,11 @@
 //! Bindings for the exact analyzed x86 build. All engine work runs on its game thread.
 
-use dd_protocol::{AdapterStatus, Command, ErrorCode, Rejection, Request, Response, VERSION};
+use dd_protocol::{
+    AdapterStatus, Command, ErrorCode, ItemOptions, Rejection, Request, Response, VERSION,
+};
+
+mod equipment;
+mod layout;
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, sync::Mutex};
 use windows_sys::Win32::System::{
@@ -244,6 +249,7 @@ impl Engine {
                 value
             };
             if class.name == "Class"
+                || class.name == "ScriptStruct"
                 || class.name.ends_with("Property")
                 || class.name == "Function"
                 || is_equipment
@@ -260,6 +266,7 @@ impl Engine {
                 .fields
                 .insert((*path).into(), engine.reflect_field(path, kind, *size)?);
         }
+        equipment::validate(&mut engine)?;
         Ok(engine)
     }
 
@@ -479,8 +486,9 @@ impl Engine {
         Ok(())
     }
 
-    fn spawn(&self, template_path: &str, quantity: u8) -> Result<String> {
+    fn spawn(&self, template_path: &str, quantity: u8, options: &ItemOptions) -> Result<String> {
         dd_protocol::validate_grant(template_path, quantity).map_err(str::to_string)?;
+        options.validate().map_err(str::to_string)?;
         require(
             dd_protocol::EQUIPMENT_CATALOG
                 .lines()
@@ -549,14 +557,22 @@ impl Engine {
                     self.is_a(drop, "UDKGame.DunDefDroppedEquipment")?;
                 }
                 let mut params = [0u32; 17];
-                params[0] = template;
+                params[0] = if let ItemOptions::Custom { settings } = options {
+                    equipment::create(self, template, session.manager, equipment_type, settings)?
+                } else {
+                    template
+                };
                 params[1] = session.pawn;
-                params[3] = 1;
+                params[2] = match options {
+                    ItemOptions::RandomRoll { strength } => strength.to_bits(),
+                    _ => 0,
+                };
+                params[3] = u32::from(!matches!(options, ItemOptions::Custom { .. }));
                 params[13] = (-2i32) as u32;
                 // Source archetypes have placeholder IDs (0,0); do not delete existing drops by those IDs.
                 // The game's InitFromNetInfo assigns fresh IDs to the newly constructed item.
                 params[15] = 1;
-                self.dispatch(session.manager, &mut params)?;
+                self.dispatch(session.manager, self.function, &mut params)?;
                 let dropped = params[16];
                 self.is_a(dropped, "UDKGame.DunDefDroppedEquipment")?;
                 self.actor_alive(dropped)?;
@@ -579,6 +595,9 @@ impl Engine {
                     id != (0, 0) && !ids.contains(&id),
                     "Returned equipment does not have a fresh item ID.",
                 )?;
+                if let ItemOptions::Custom { settings } = options {
+                    equipment::verify(self, item, settings)?;
+                }
                 ids.push(id);
                 Ok(())
             })();
@@ -595,26 +614,26 @@ impl Engine {
     }
 
     #[cfg(target_arch = "x86")]
-    fn dispatch(&self, manager: u32, params: &mut [u32; 17]) -> Result<()> {
+    fn dispatch(&self, object: u32, function: u32, params: &mut [u32]) -> Result<()> {
         self.check_thread()?;
-        // SAFETY: exact image hash, thread, live manager, vtable target, reflected function and every
+        self.live_object(object)?;
+        require(
+            u32_at(u32_at(object)? + 0x104)? == self.base + PROCESS_EVENT,
+            "Object dispatcher does not match the verified build.",
+        )?;
+        // SAFETY: exact image hash, thread, live object, vtable target, reflected function and every
         // parameter's offset/type/size were checked immediately before this call. This x86 ABI was
         // recovered from the shipped caller and callee (ECX=this, three stack args, ret 12).
         unsafe {
             let call: unsafe extern "thiscall" fn(u32, u32, *mut u32, *mut std::ffi::c_void) =
                 std::mem::transmute((self.base + PROCESS_EVENT) as usize);
-            call(
-                manager,
-                self.function,
-                params.as_mut_ptr(),
-                std::ptr::null_mut(),
-            );
+            call(object, function, params.as_mut_ptr(), std::ptr::null_mut());
         }
         Ok(())
     }
 
     #[cfg(not(target_arch = "x86"))]
-    fn dispatch(&self, _: u32, _: &mut [u32; 17]) -> Result<()> {
+    fn dispatch(&self, _: u32, _: u32, _: &mut [u32]) -> Result<()> {
         Err("Only the x86 adapter can dispatch game functions.".into())
     }
 }
@@ -630,19 +649,20 @@ pub fn initialize() -> Result<()> {
 }
 
 pub fn handle(request: Request) -> Response {
-    let result: Result<AdapterStatus> = (|| {
-        require(
-            request.version == VERSION,
-            "Overlay and adapter versions differ.",
-        )?;
-        let state = STATE.lock().map_err(|_| "Engine state lock failed.")?;
-        let engine = state
-            .as_ref()
-            .ok_or("Game adapter has not initialized.")?
-            .as_ref()
-            .map_err(Clone::clone)?;
-        let ready = engine.session();
-        let (can_give, message) = match request.command {
+    let result: Result<AdapterStatus> =
+        (|| {
+            require(
+                request.version == VERSION,
+                "Overlay and adapter versions differ.",
+            )?;
+            let state = STATE.lock().map_err(|_| "Engine state lock failed.")?;
+            let engine = state
+                .as_ref()
+                .ok_or("Game adapter has not initialized.")?
+                .as_ref()
+                .map_err(Clone::clone)?;
+            let ready = engine.session();
+            let (can_give, message) = match request.command {
             Command::Status {} => match ready {
                 Ok(_) => (
                     true,
@@ -651,20 +671,20 @@ pub fn handle(request: Request) -> Response {
                 ),
                 Err(error) => (false, error),
             },
-            Command::Give { template, quantity } => {
+            Command::Give { template, quantity, options } => {
                 ready?;
-                (true, engine.spawn(&template, quantity)?)
+                (true, engine.spawn(&template, quantity, &options)?)
             }
             Command::Shutdown {} => (false, "Game adapter disconnected.".into()),
         };
-        Ok(AdapterStatus {
-            pid: std::process::id(),
-            bits: usize::BITS,
-            diagnostic: false,
-            can_give,
-            message,
-        })
-    })();
+            Ok(AdapterStatus {
+                pid: std::process::id(),
+                bits: usize::BITS,
+                diagnostic: false,
+                can_give,
+                message,
+            })
+        })();
     let result = result.map_err(|message| Rejection {
         code: if request.version != VERSION {
             ErrorCode::ProtocolMismatch

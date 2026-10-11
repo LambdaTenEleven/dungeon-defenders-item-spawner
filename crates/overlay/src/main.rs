@@ -2,6 +2,7 @@
 
 mod connection;
 mod diagnostics;
+mod editor;
 mod game;
 
 use connection::GameConnection;
@@ -45,6 +46,7 @@ struct Overlay {
     selected: usize,
     template: String,
     quantity: u8,
+    editor: editor::ItemEditor,
     install_path: String,
     game_status: String,
     game_running: bool,
@@ -75,6 +77,7 @@ impl Overlay {
             selected,
             template,
             quantity: 1,
+            editor: editor::ItemEditor::default(),
             install_path: game::find_installation()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
@@ -136,6 +139,13 @@ impl Overlay {
         });
     }
 
+    fn is_weapon(&self) -> bool {
+        self.templates
+            .iter()
+            .find(|item| item.path == self.template)
+            .is_none_or(|item| item.kind == "Weapon")
+    }
+
     fn spawn_item(&mut self, context: egui::Context) {
         let Some(connection) = &self.connection else {
             return;
@@ -144,6 +154,7 @@ impl Overlay {
         let command = Command::Give {
             template: self.template.clone(),
             quantity: self.quantity,
+            options: self.editor.options(self.is_weapon()),
         };
         self.busy = true;
         self.adapter_status = "Spawning pickup…".into();
@@ -209,6 +220,7 @@ impl eframe::App for Overlay {
         }
         ui.ctx().request_repaint_after(Duration::from_millis(250));
         egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("main-panel").show(ui, |ui| {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.heading("Dungeon Workshop");
@@ -254,16 +266,20 @@ impl eframe::App for Overlay {
                     ui.label("Quantity");
                     ui.add(egui::DragValue::new(&mut self.quantity).range(1..=MAX_QUANTITY));
                 });
-                if let Err(error) = validate_grant(&self.template, self.quantity) {
+                right.add_space(8.0);
+                let weapon = self.is_weapon();
+                self.editor.show(right, weapon);
+                let valid = validate_grant(&self.template, self.quantity).and_then(|()| self.editor.options(weapon).validate());
+                if let Err(error) = valid {
                     right.colored_label(Color32::from_rgb(240, 150, 120), error);
                 }
                 right.add_space(10.0);
-                if right.add_enabled(self.can_spawn && !self.busy && validate_grant(&self.template, self.quantity).is_ok(), egui::Button::new("Spawn pickup").min_size(egui::vec2(160.0, 34.0))).clicked() { self.spawn_item(right.ctx().clone()); }
-                right.label("Creates equipment near your hero with its template stats. Pick it up normally to equip or store it.");
+                if right.add_enabled(self.can_spawn && !self.busy && valid.is_ok(), egui::Button::new("Spawn pickup").min_size(egui::vec2(160.0, 34.0))).clicked() { self.spawn_item(right.ctx().clone()); }
+                right.label("Creates equipment near your hero with the selected settings. Pick it up normally to equip or store it.");
             });
             ui.add_space(16.0);
             ui.separator();
-            egui::CollapsingHeader::new("Game installation").default_open(true).show(ui, |ui| {
+            egui::CollapsingHeader::new("Game installation").default_open(false).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.install_path).desired_width(ui.available_width() - 86.0));
                     if ui.add_enabled(!self.busy, egui::Button::new("Check")).clicked() { self.inspect_game(ui.ctx().clone()); }
@@ -291,6 +307,7 @@ impl eframe::App for Overlay {
             ui.label(&self.adapter_status);
             ui.add_space(6.0);
             ui.label(RichText::new("Local single-player only. Picked-up items can be saved by the game. Restart the game before replacing an attached adapter DLL.").small().weak());
+            });
         });
     }
 }
@@ -313,8 +330,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([820.0, 690.0])
-            .with_min_inner_size([680.0, 650.0])
+            .with_inner_size([980.0, 820.0])
+            .with_min_inner_size([780.0, 700.0])
             .with_always_on_top(),
         ..Default::default()
     };

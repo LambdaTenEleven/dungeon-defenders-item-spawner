@@ -3,10 +3,13 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
+pub mod items;
+pub use items::{CustomItem, ItemOptions, Quality, WeaponStats};
+
 #[cfg(windows)]
 pub mod pipe;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024;
 pub const MAX_QUANTITY: u8 = 10;
 /// Packaged equipment references from the analyzed Startup_INT.upk; no game assets are embedded.
@@ -34,7 +37,11 @@ impl Request {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     Status {},
-    Give { template: String, quantity: u8 },
+    Give {
+        template: String,
+        quantity: u8,
+        options: ItemOptions,
+    },
     Shutdown {},
 }
 
@@ -150,6 +157,7 @@ mod tests {
                 Command::Give {
                     template: "Package.Group.Item".into(),
                     quantity: 2,
+                    options: ItemOptions::default(),
                 },
             ),
         )

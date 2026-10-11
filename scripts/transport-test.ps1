@@ -28,7 +28,7 @@ function Read-Exact([IO.Stream]$Stream, [int]$Count) {
 function Send-Status([switch]$Fragmented) {
     $pipe = Connect-TestPipe
     try {
-        $payload = [Text.Encoding]::UTF8.GetBytes('{"version":1,"id":77,"command":{"type":"status"}}')
+        $payload = [Text.Encoding]::UTF8.GetBytes('{"version":2,"id":77,"command":{"type":"status"}}')
         $frame = [BitConverter]::GetBytes([uint32]$payload.Length) + $payload
         if ($Fragmented) {
             foreach ($value in $frame) { $pipe.WriteByte($value); Start-Sleep -Milliseconds 1 }
