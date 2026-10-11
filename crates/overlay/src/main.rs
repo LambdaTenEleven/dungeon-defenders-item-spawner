@@ -5,6 +5,7 @@ mod diagnostics;
 mod editor;
 mod game;
 mod number_input;
+mod search;
 
 use connection::GameConnection;
 use dd_protocol::{AdapterStatus, Command, MAX_QUANTITY, validate_grant};
@@ -12,7 +13,11 @@ use diagnostics::DiagnosticHost;
 use eframe::egui::{self, Color32, RichText};
 use std::{
     path::Path,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -35,6 +40,7 @@ fn templates() -> Vec<Template> {
 }
 
 enum Event {
+    Progress(String),
     Adapter(Result<(DiagnosticHost, AdapterStatus), String>),
     Game(Result<String, String>),
     Connected(Result<(GameConnection, AdapterStatus), String>),
@@ -56,6 +62,7 @@ struct Overlay {
     connection: Option<GameConnection>,
     can_spawn: bool,
     busy: bool,
+    search_cancel: Option<Arc<AtomicBool>>,
     topmost: bool,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
@@ -89,6 +96,7 @@ impl Overlay {
             connection: None,
             can_spawn: false,
             busy: false,
+            search_cancel: None,
             topmost: true,
             tx,
             rx,
@@ -163,19 +171,43 @@ impl Overlay {
         };
         self.busy = true;
         self.adapter_status = "Spawning pickup…".into();
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Command::Give { options, .. } = &command
+            && options.needs_search()
+        {
+            self.search_cancel = Some(Arc::clone(&cancel));
+            self.adapter_status = "Searching natural rolls…".into();
+        }
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Event::Spawned(connection::request(pid, command)));
+            let result = search::run(pid, command, &cancel, |message| {
+                let _ = tx.send(Event::Progress(message));
+                context.request_repaint();
+            });
+            let _ = tx.send(Event::Spawned(result));
             context.request_repaint();
         });
+    }
+}
+
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.search_cancel {
+            cancel.store(true, Ordering::Release);
+        }
     }
 }
 
 impl eframe::App for Overlay {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         while let Ok(event) = self.rx.try_recv() {
+            if let Event::Progress(message) = event {
+                self.adapter_status = message;
+                continue;
+            }
             self.busy = false;
             match event {
+                Event::Progress(_) => unreachable!(),
                 Event::Game(result) => {
                     self.game_status =
                         result.unwrap_or_else(|e| format!("Could not inspect game: {e}"))
@@ -192,10 +224,12 @@ impl eframe::App for Overlay {
                 }
                 Event::Connected(Err(error)) => self.adapter_status = error,
                 Event::Spawned(Ok(status)) => {
+                    self.search_cancel = None;
                     self.can_spawn = status.can_give;
                     self.adapter_status = status.message;
                 }
                 Event::Spawned(Err(error)) => {
+                    self.search_cancel = None;
                     self.adapter_status = error;
                     self.can_spawn = false;
                 }
@@ -210,6 +244,9 @@ impl eframe::App for Overlay {
                 .is_some_and(|connection| !connection.is_running())
             {
                 self.connection = None;
+                if let Some(cancel) = &self.search_cancel {
+                    cancel.store(true, Ordering::Release);
+                }
                 self.can_spawn = false;
                 self.adapter_status =
                     "Game attachment ended. Connect again when the game is ready.".into();
@@ -225,6 +262,7 @@ impl eframe::App for Overlay {
         }
         ui.ctx().request_repaint_after(Duration::from_millis(250));
         egui::CentralPanel::default().show(ui, |ui| {
+            let equipment_height = (ui.available_height() - 330.0).max(140.0);
             egui::ScrollArea::vertical().id_salt("main-panel").show(ui, |ui| {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -251,7 +289,7 @@ impl eframe::App for Overlay {
                 left.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search weapons, armor, or package…").desired_width(f32::INFINITY));
                 left.add_space(8.0);
                 let search = self.search.to_lowercase();
-                egui::ScrollArea::vertical().max_height(170.0).auto_shrink([false, false]).show(left, |ui| {
+                egui::ScrollArea::vertical().max_height(equipment_height).auto_shrink([false, false]).show(left, |ui| {
                 for (index, item) in self.templates.iter().enumerate() {
                     if !format!("{} {}", item.path, item.kind).to_lowercase().contains(&search) { continue; }
                     if ui.selectable_label(self.selected == index, format!("{}  ·  {}", item.name, item.kind)).on_hover_text(item.path).clicked() {
@@ -274,13 +312,17 @@ impl eframe::App for Overlay {
                 });
                 right.add_space(8.0);
                 let weapon = self.is_weapon();
-                self.editor.show(right, weapon);
+                self.editor.show(right, weapon, (equipment_height - 145.0).max(80.0));
                 let valid = validate_grant(&self.template, self.request_quantity()).and_then(|()| self.editor.options(weapon).validate());
                 if let Err(error) = valid {
                     right.colored_label(Color32::from_rgb(240, 150, 120), error);
                 }
                 right.add_space(10.0);
-                if right.add_enabled(self.can_spawn && !self.busy && valid.is_ok(), egui::Button::new("Spawn pickup").min_size(egui::vec2(160.0, 34.0))).clicked() { self.spawn_item(right.ctx().clone()); }
+                right.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                    if ui.add_enabled(self.can_spawn && !self.busy && valid.is_ok(), egui::Button::new("Spawn pickup").min_size(egui::vec2(ui.available_width(), 34.0))).clicked() { self.spawn_item(ui.ctx().clone()); }
+                });
+                if let Some(cancel) = &self.search_cancel
+                    && right.button("Cancel search").clicked() { cancel.store(true, Ordering::Release); }
                 right.label("Creates equipment near your hero with the selected settings. Pick it up normally to equip or store it.");
             });
             ui.add_space(16.0);
@@ -336,8 +378,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 820.0])
-            .with_min_inner_size([780.0, 700.0])
+            .with_inner_size([980.0, 600.0])
+            .with_min_inner_size([640.0, 420.0])
             .with_always_on_top(),
         ..Default::default()
     };

@@ -22,9 +22,29 @@ read back after normal pickup into the item box.
 5. Pick it up in-game to equip or store it. Collected items appear in your item
    box. Normal game saves can retain picked-up items.
 
-In **Random roll**, strength 0.01–2.0 is the game's randomizer input. It does not
-force a named rarity: template settings, mission difficulty and map multipliers
-still apply. Some templates keep a fixed quality or disable randomization.
+In **Random roll**, choose **Any** quality for an ordinary roll, or select a tier
+to search naturally generated rolls for an exact match. The strength slider
+(0.01–2.0), template settings and selected **Loot conditions** determine the rolls.
+The tool never relabels an unsuccessful roll or changes its stats to force a match.
+Some templates cannot produce every tier or disable randomization entirely.
+
+**Current mission** preserves the game's current map/difficulty modifiers.
+**Tavern testing** uses a fixed high-level testing profile anywhere: a 33.0 mission
+multiplier override, each template's last configured difficulty-specific upgrade
+range, and its normal (non-Ruthless) Ultimate promotion probabilities. The game
+still rolls stats, negative bonuses, upgrade counts and quality itself. This is a
+testing profile, not a reproduction of one particular map's loot distribution.
+It changes only newly created temporary equipment, never live game difficulty or
+shared templates. **Any** quality also works with Tavern testing; multiple items
+are paced one at a time. Unreachable tiers can still exhaust the search limit.
+
+Searches stop after 200 candidates or 15 seconds across the requested quantity.
+The app waits at least 50 ms between single-candidate game-thread requests;
+rejected candidates never become floor pickups. **Cancel search** stops further
+attempts after the current request finishes. Progress and the final message report
+how many pickups were actually spawned, including partial results. Communication
+errors stop the search without retrying an uncertain spawn. A candidate taking
+over 8 ms stops the search; an individual game script call cannot be interrupted.
 
 In **Custom**, select a quality or keep **Template**, then check only the fields
 you want to override. Unchecked values remain inherited. Hero/defense bonuses,
@@ -33,7 +53,8 @@ controls are **bonuses**, not final displayed totals; a weapon may not use every
 bonus. Elemental damage keeps the template's element. Special items can retain
 their fixed name and beam color even with a different quality tier.
 
-Type quantities, roll strength and custom values directly into their text boxes.
+Type quantities and custom values directly into their text boxes. Adjust roll
+strength with the slider.
 Dragging selects text without changing the number. Empty, incomplete and
 out-of-range entries disable spawning until corrected.
 
@@ -44,7 +65,7 @@ because larger values wrap in the game's serialization. The adapter also checks
 template minimum damage/upgrades and rejects a current level above the maximum.
 Leave both upgrade fields unchecked to preserve template defaults.
 
-This release uses protocol version 2. Keep the three matching binaries together;
+This release uses protocol version 4. Keep the three matching binaries together;
 restart the game before replacing an older attached adapter.
 
 **Run isolated adapter test** is a separate diagnostic; it never connects to the
@@ -97,7 +118,7 @@ To test an extracted release without opening a window:
 
 ```powershell
 .\dd-overlay.exe --self-test
-.\dd-overlay.exe --check-game 'D:\SteamLibrary\steamapps\common\Dungeon Defenders'
+.\dd-overlay.exe --check-game '<game-installation-folder>'
 ```
 
 The test loads the real DLL, verifies the server process and architecture, checks

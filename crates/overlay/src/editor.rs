@@ -16,6 +16,8 @@ enum Mode {
 pub struct ItemEditor {
     mode: Mode,
     strength: f32,
+    quality: Option<Quality>,
+    conditions: dd_protocol::LootConditions,
     custom: CustomItem,
 }
 
@@ -24,6 +26,8 @@ impl Default for ItemEditor {
         Self {
             mode: Mode::Template,
             strength: 1.0,
+            quality: None,
+            conditions: dd_protocol::LootConditions::CurrentMission,
             custom: CustomItem::default(),
         }
     }
@@ -53,6 +57,8 @@ impl ItemEditor {
             Mode::Template => ItemOptions::TemplateDefaults,
             Mode::Random => ItemOptions::RandomRoll {
                 strength: self.strength,
+                quality: self.quality,
+                conditions: self.conditions,
             },
             Mode::Custom => {
                 let mut settings = self.custom.clone();
@@ -68,7 +74,7 @@ impl ItemEditor {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, weapon: bool) {
+    pub fn show(&mut self, ui: &mut egui::Ui, weapon: bool, stats_height: f32) {
         ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
         egui::ComboBox::from_id_salt("item-mode")
             .selected_text(match self.mode {
@@ -87,11 +93,50 @@ impl ItemEditor {
             }
             Mode::Random => {
                 ui.horizontal(|ui| {
-                    ui.label("Roll strength");
-                    number_input(ui, "roll-strength", &mut self.strength, f32::NAN)
-                        .on_hover_text("Enter a number between 0.01 and 2.0.");
+                    use dd_protocol::LootConditions;
+                    ui.label("Loot conditions");
+                    egui::ComboBox::from_id_salt("loot-conditions")
+                        .selected_text(match self.conditions {
+                            LootConditions::CurrentMission => "Current mission",
+                            LootConditions::TavernTesting => "Tavern testing",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.conditions,
+                                LootConditions::CurrentMission,
+                                "Current mission",
+                            );
+                            ui.selectable_value(
+                                &mut self.conditions,
+                                LootConditions::TavernTesting,
+                                "Tavern testing",
+                            );
+                        });
                 });
-                ui.label("The game rolls stats and quality. Strength does not guarantee a rarity; template and map rules still apply.");
+                ui.horizontal(|ui| {
+                    ui.label("Quality");
+                    egui::ComboBox::from_id_salt("roll-quality")
+                        .selected_text(self.quality.map_or("Any", Quality::label))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.quality, None, "Any");
+                            for quality in Quality::ALL {
+                                ui.selectable_value(
+                                    &mut self.quality,
+                                    Some(quality),
+                                    quality.label(),
+                                );
+                            }
+                        });
+                });
+                ui.add(
+                    egui::Slider::new(&mut self.strength, 0.01..=2.0)
+                        .text("Roll strength")
+                        .fixed_decimals(2),
+                );
+                ui.label("A selected quality searches natural rolls for up to 200 attempts or 15 seconds. Some templates cannot roll every tier.");
+                if self.conditions == dd_protocol::LootConditions::TavernTesting {
+                    ui.small("Fixed high-level conditions, independent of map and difficulty. Your game settings stay unchanged.");
+                }
             }
             Mode::Custom => {
                 ui.horizontal(|ui| {
@@ -113,7 +158,7 @@ impl ItemEditor {
                     }
                 });
                 ui.small("Check a field to override it. Unchecked fields keep template values.");
-                egui::ScrollArea::vertical().id_salt("custom-stats").max_height(310.0).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("custom-stats").max_height(stats_height).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).show(ui, |ui| {
                     egui::CollapsingHeader::new("Upgrades").default_open(true).show(ui, |ui| {
                         egui::Grid::new("upgrades").num_columns(2).show(ui, |ui| {
                             optional(ui, "Current level", &mut self.custom.upgrade_level, 1, UPGRADE_LIMIT);

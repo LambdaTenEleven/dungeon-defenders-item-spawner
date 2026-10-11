@@ -89,7 +89,11 @@ pub fn self_test() -> Result<(), String> {
     let mut custom = dd_protocol::CustomItem::default();
     custom.weapon.projectiles = Some(129);
     for options in [
-        dd_protocol::ItemOptions::RandomRoll { strength: 0.0 },
+        dd_protocol::ItemOptions::RandomRoll {
+            strength: 0.0,
+            quality: None,
+            conditions: dd_protocol::LootConditions::CurrentMission,
+        },
         dd_protocol::ItemOptions::Custom {
             settings: Box::new(custom),
         },

@@ -25,10 +25,20 @@ pub enum ItemOptions {
     TemplateDefaults,
     RandomRoll {
         strength: f32,
+        quality: Option<Quality>,
+        conditions: LootConditions,
     },
     Custom {
         settings: Box<CustomItem>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LootConditions {
+    #[default]
+    CurrentMission,
+    TavernTesting,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,10 +150,23 @@ fn range(value: Option<i32>, min: i32, max: i32) -> bool {
 }
 
 impl ItemOptions {
+    pub fn needs_search(&self) -> bool {
+        matches!(
+            self,
+            Self::RandomRoll {
+                quality: Some(_),
+                ..
+            } | Self::RandomRoll {
+                conditions: LootConditions::TavernTesting,
+                ..
+            }
+        )
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::TemplateDefaults => Ok(()),
-            Self::RandomRoll { strength } => {
+            Self::RandomRoll { strength, .. } => {
                 if strength.is_finite() && (0.01..=2.0).contains(strength) {
                     Ok(())
                 } else {
@@ -220,7 +243,15 @@ mod tests {
         settings.hero_stats[2] = Some(500);
         assert!(settings.validate().is_ok());
         for strength in [0.0, -1.0, 2.01, f32::NAN, f32::INFINITY] {
-            assert!(ItemOptions::RandomRoll { strength }.validate().is_err());
+            assert!(
+                ItemOptions::RandomRoll {
+                    strength,
+                    quality: None,
+                    conditions: LootConditions::CurrentMission,
+                }
+                .validate()
+                .is_err()
+            );
         }
     }
 
@@ -230,6 +261,56 @@ mod tests {
         assert_eq!(Quality::Cursed as u8, 12);
         assert_eq!(Quality::Mythical as u8, 13);
         assert_eq!(Quality::UltimatePlusPlus as u8, 19);
+    }
+
+    #[test]
+    fn tavern_any_quality_is_paced_and_roundtrips() {
+        let options = ItemOptions::RandomRoll {
+            strength: 1.0,
+            quality: None,
+            conditions: LootConditions::TavernTesting,
+        };
+        assert!(options.needs_search());
+        assert_eq!(
+            serde_json::from_str::<ItemOptions>(&serde_json::to_string(&options).unwrap()).unwrap(),
+            options
+        );
+        assert!(
+            !ItemOptions::RandomRoll {
+                strength: 1.0,
+                quality: None,
+                conditions: LootConditions::CurrentMission
+            }
+            .needs_search()
+        );
+        assert!(
+            serde_json::from_str::<ItemOptions>(
+                r#"{"mode":"random_roll","strength":1,"quality":null,"conditions":"invalid"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn filtered_random_roll_roundtrips_and_rejects_unknown_tiers() {
+        for quality in [None, Some(Quality::Cursed), Some(Quality::UltimatePlusPlus)] {
+            let options = ItemOptions::RandomRoll {
+                strength: 1.5,
+                quality,
+                conditions: LootConditions::CurrentMission,
+            };
+            assert_eq!(
+                serde_json::from_str::<ItemOptions>(&serde_json::to_string(&options).unwrap())
+                    .unwrap(),
+                options
+            );
+        }
+        assert!(
+            serde_json::from_str::<ItemOptions>(
+                r#"{"mode":"random_roll","strength":1,"quality":"invalid"}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

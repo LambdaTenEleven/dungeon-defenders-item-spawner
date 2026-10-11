@@ -6,6 +6,7 @@ use dd_protocol::{
 
 mod equipment;
 mod layout;
+mod tavern;
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, sync::Mutex};
 use windows_sys::Win32::System::{
@@ -486,9 +487,19 @@ impl Engine {
         Ok(())
     }
 
-    fn spawn(&self, template_path: &str, quantity: u8, options: &ItemOptions) -> Result<String> {
+    fn spawn(
+        &self,
+        template_path: &str,
+        quantity: u8,
+        options: &ItemOptions,
+    ) -> Result<Option<String>> {
         dd_protocol::validate_grant(template_path, quantity).map_err(str::to_string)?;
         options.validate().map_err(str::to_string)?;
+        let filtered = options.needs_search();
+        require(
+            !filtered || quantity == 1,
+            "Filtered rolls require one candidate per request.",
+        )?;
         require(
             dd_protocol::EQUIPMENT_CATALOG
                 .lines()
@@ -533,7 +544,7 @@ impl Engine {
         let mut confirmed = 0;
         let mut ids = Vec::new();
         for _ in 0..quantity {
-            let result: Result<()> = (|| {
+            let result: Result<bool> = (|| {
                 let session = self.session()?;
                 self.validate_function()?;
                 let drops = array(
@@ -559,15 +570,35 @@ impl Engine {
                 let mut params = [0u32; 17];
                 params[0] = if let ItemOptions::Custom { settings } = options {
                     equipment::create(self, template, session.manager, equipment_type, settings)?
+                } else if let ItemOptions::RandomRoll {
+                    strength,
+                    quality,
+                    conditions,
+                } = options
+                    && filtered
+                {
+                    let Some(item) = equipment::roll(
+                        self,
+                        template,
+                        session.manager,
+                        equipment_type,
+                        *strength,
+                        *quality,
+                        *conditions,
+                    )?
+                    else {
+                        return Ok(false);
+                    };
+                    item
                 } else {
                     template
                 };
                 params[1] = session.pawn;
                 params[2] = match options {
-                    ItemOptions::RandomRoll { strength } => strength.to_bits(),
+                    ItemOptions::RandomRoll { strength, .. } if !filtered => strength.to_bits(),
                     _ => 0,
                 };
-                params[3] = u32::from(!matches!(options, ItemOptions::Custom { .. }));
+                params[3] = u32::from(!filtered && !matches!(options, ItemOptions::Custom { .. }));
                 params[13] = (-2i32) as u32;
                 // Source archetypes have placeholder IDs (0,0); do not delete existing drops by those IDs.
                 // The game's InitFromNetInfo assigns fresh IDs to the newly constructed item.
@@ -598,9 +629,26 @@ impl Engine {
                 if let ItemOptions::Custom { settings } = options {
                     equipment::verify(self, item, settings)?;
                 }
+                if let ItemOptions::RandomRoll {
+                    quality: Some(quality),
+                    ..
+                } = options
+                {
+                    equipment::verify(
+                        self,
+                        item,
+                        &dd_protocol::CustomItem {
+                            quality: Some(*quality),
+                            ..Default::default()
+                        },
+                    )?;
+                }
                 ids.push(id);
-                Ok(())
+                Ok(true)
             })();
+            if matches!(result, Ok(false)) {
+                return Ok(None);
+            }
             if let Err(error) = result {
                 return Err(format!(
                     "{confirmed} pickup(s) confirmed. {error} Check the game before retrying; a dispatched action may have completed."
@@ -608,9 +656,9 @@ impl Engine {
             }
             confirmed += 1;
         }
-        Ok(format!(
+        Ok(Some(format!(
             "Spawned {confirmed} pickup(s) nearby. Pick them up in the game to equip or store them."
-        ))
+        )))
     }
 
     #[cfg(target_arch = "x86")]
@@ -662,6 +710,7 @@ pub fn handle(request: Request) -> Response {
                 .as_ref()
                 .map_err(Clone::clone)?;
             let ready = engine.session();
+            let mut roll_matched = None;
             let (can_give, message) = match request.command {
             Command::Status {} => match ready {
                 Ok(_) => (
@@ -673,7 +722,11 @@ pub fn handle(request: Request) -> Response {
             },
             Command::Give { template, quantity, options } => {
                 ready?;
-                (true, engine.spawn(&template, quantity, &options)?)
+                let result = engine.spawn(&template, quantity, &options)?;
+                if options.needs_search() {
+                    roll_matched = Some(result.is_some());
+                }
+                (true, result.unwrap_or_else(|| "Roll did not match; nothing spawned.".into()))
             }
             Command::Shutdown {} => (false, "Game adapter disconnected.".into()),
         };
@@ -682,6 +735,7 @@ pub fn handle(request: Request) -> Response {
                 bits: usize::BITS,
                 diagnostic: false,
                 can_give,
+                roll_matched,
                 message,
             })
         })();

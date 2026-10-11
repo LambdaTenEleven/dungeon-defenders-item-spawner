@@ -4,12 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 pub mod items;
-pub use items::{CustomItem, ItemOptions, Quality, WeaponStats};
+pub use items::{CustomItem, ItemOptions, LootConditions, Quality, WeaponStats};
 
 #[cfg(windows)]
 pub mod pipe;
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 4;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024;
 pub const MAX_QUANTITY: u8 = 10;
 /// Packaged equipment references from the analyzed Startup_INT.upk; no game assets are embedded.
@@ -60,6 +60,8 @@ pub struct AdapterStatus {
     pub bits: u32,
     pub diagnostic: bool,
     pub can_give: bool,
+    /// Set for a paced single-candidate roll; false confirms nothing was spawned.
+    pub roll_matched: Option<bool>,
     pub message: String,
 }
 

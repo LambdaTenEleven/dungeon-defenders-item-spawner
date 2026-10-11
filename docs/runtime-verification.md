@@ -3,10 +3,10 @@
 Verified on 2026-10-11 with Steam build 25809881, Win32 executable SHA-256
 `4e4b03765c9e74415e27e36d952ebecd86a655ca27d8a46b5285279773e6d0f4`.
 
-REA supplied the earlier artifact/provider evidence. Native providers were not
-configured. The native findings here came from supplemental PE/Capstone analysis
-of the user's installed executable, corroborated with read-only process memory
-and live adapter execution. No game binaries or decompiled scripts are included.
+REA supplied the earlier artifact identity evidence. The native findings came
+from supplemental PE/Capstone analysis of the supported executable, corroborated
+with read-only process memory and live adapter execution. No game binaries or
+decompiled scripts are included.
 
 ## Build-specific bindings
 
@@ -139,3 +139,55 @@ an ambiguous operation result. Not every catalog entry has been spawned.
 The adapter DLL is pinned until game exit to prevent a callback or worker from
 executing unmapped code. Disconnect removes the host's thread hook and stops IPC;
 it does not unload the DLL. Restart the game before replacing an attached build.
+# Quality-filtered natural rolls (2026-10-11)
+
+The randomizer's live reflected ABI was checked against the retained script:
+`HeroEquipment.AddRandomizeValues`, six 4-byte parameters, flags `0x824002`,
+no native index or return value. Each filtered request creates one temporary
+equipment object, invokes the normal mission-aware randomizer, and spawns only
+an exact quality match. No engine object pointer is retained between requests.
+
+Live local-tavern checks with protocol 3:
+- Legendary pristine helmet matched on attempt 7. Independent memory readback
+  found one floor pickup and identical candidate/final stats, quality, and
+  17 maximum upgrades. Source template bytes stayed unchanged.
+- Twenty Ultimate++ misses created no floor pickups.
+- The actual overlay search controller cancelled after 15 rolls in 1.04 seconds.
+- The actual controller stopped an unsuccessful search at 200 rolls in 13.08 seconds.
+
+Requests are separated by a 50 ms app-side wait. Searches also have a 15-second
+deadline, and stop if candidate creation/randomization exceeds 8 ms. The engine
+script itself cannot be preempted; these are bounded-work safeguards, not a
+hard real-time guarantee. Search unit tests cover pacing, quantity accounting,
+attempt limits, cancellation, and stopping on uncertain communication failures.
+Save/reload persistence and rare-tier matches remain unverified.
+
+A follow-up game-window message latency probe during 60 nonmatching rolls had
+296 samples, zero 250 ms timeouts, and about 16 ms maximum latency (the same
+maximum as the baseline). This checks main-thread responsiveness, not rendered FPS.
+
+## Tavern testing profile (2026-10-11)
+
+Protocol 4 adds Current mission / Tavern testing to Random roll. Tavern testing
+passes the randomizer's mission override flag and a fixed multiplier of 33.0.
+Before rolling, it fills each temporary item's independently allocated difficulty
+range array with the last template range, and makes normal/Ruthless promotion
+probabilities equal to the template's normal values. Reflected types, offsets,
+array element layout, bounds, and non-aliasing are checked before candidate writes.
+No game globals, executable code, or source archetypes are changed.
+
+Live single-player tavern tests produced one Mythical pristine helmet on attempt
+2 and one Ultimate helmet on attempt 23, with natural stats and one floor pickup
+per successful search. Full source object bytes remained unchanged. A separate
+Sword of Embers roll with Any quality verified the alternate upgrade calculation:
+its candidate used [50, 255] at all five difficulty indices, while the template
+and final pickup retained the original per-difficulty configuration. Live game
+difficulty remained index 3 and Ruthless remained false before/after that test.
+
+Static inspection of AddRandomizeValues and its randomizer/rating/promotion
+helpers identified the mission multiplier, difficulty upgrade range and Ruthless
+probabilities as the stat-generation dependencies neutralized by this profile.
+The normal generation timestamp still records the actual map. The multiplayer
+branch is fixed by the adapter's existing local-single-player guard. This is a
+fixed testing distribution using game algorithms, not one specific map's drops.
+Rare-tier matching and save/reload persistence have not been exhaustively tested.

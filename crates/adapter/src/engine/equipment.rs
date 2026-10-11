@@ -355,6 +355,87 @@ pub(super) fn verify(engine: &Engine, item: u32, settings: &CustomItem) -> Resul
     Ok(())
 }
 
+/// One candidate per hook invocation. No temporary engine pointer survives this call.
+pub(super) fn roll(
+    engine: &Engine,
+    template: u32,
+    owner: u32,
+    kind: u32,
+    strength: f32,
+    quality: Option<dd_protocol::Quality>,
+    conditions: dd_protocol::LootConditions,
+) -> Result<Option<u32>> {
+    const RANDOMIZE: &str = "UDKGame.HeroEquipment.AddRandomizeValues";
+    require(
+        !engine.flag(
+            template,
+            "UDKGame.HeroEquipmentNative.bDisableTheRandomization",
+        )?,
+        "This template disables natural randomization. Use Template defaults or Custom.",
+    )?;
+    let function = engine.reference(RANDOMIZE)?;
+    let header = read(function + 0x90, 0x18)?;
+    require(
+        u32_at(function + 0x34)? == engine.reference("Core.Function")?
+            && word(&header, 0) == 0x824002
+            && u16::from_le_bytes([header[4], header[5]]) == 0
+            && u16::from_le_bytes([header[0x12], header[0x13]]) == 24
+            && u16::from_le_bytes([header[0x14], header[0x15]]) == u16::MAX,
+        "Randomizer function ABI changed.",
+    )?;
+    for (index, (name, kind)) in [
+        ("equipmentQuality", "Core.FloatProperty"),
+        ("doResetStatsToTemplate", "Core.BoolProperty"),
+        ("bDontUseMissionRandomizerMultiplier", "Core.BoolProperty"),
+        ("RandomizerMultiplierOverride", "Core.FloatProperty"),
+        ("bIsForShop", "Core.BoolProperty"),
+        ("bAllowTranscendentGear", "Core.BoolProperty"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let path = format!("{RANDOMIZE}.{name}");
+        let field = engine.reflect_field(&path, kind, 4)?;
+        require(
+            field.offset == index as u32 * 4
+                && field.count == 1
+                && u32_at(engine.reference(&path)? + 0x4c)? & 0x80 != 0
+                && (*kind != "Core.BoolProperty" || field.mask == 1),
+            "Randomizer parameter ABI changed.",
+        )?;
+    }
+    let started = std::time::Instant::now();
+    let item = create(engine, template, owner, kind, &CustomItem::default())?;
+    let tavern = conditions == dd_protocol::LootConditions::TavernTesting;
+    if tavern {
+        super::tavern::prepare(engine, template, item)?;
+    }
+    engine.dispatch(
+        item,
+        function,
+        &mut [
+            strength.to_bits(),
+            0,
+            u32::from(tavern),
+            if tavern { 33.0f32.to_bits() } else { 0 },
+            0,
+            1,
+        ],
+    )?;
+    // A script call cannot be interrupted. Stop the search if even one candidate is expensive.
+    require(
+        started.elapsed() <= std::time::Duration::from_millis(8),
+        "A candidate took too long; search stopped to protect game responsiveness. Nothing spawned.",
+    )?;
+    let actual = engine.value(
+        item,
+        "UDKGame.HeroEquipmentNative.NameIndex_QualityDescriptor",
+    )?;
+    Ok(quality
+        .is_none_or(|quality| actual == quality as u32)
+        .then_some(item))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

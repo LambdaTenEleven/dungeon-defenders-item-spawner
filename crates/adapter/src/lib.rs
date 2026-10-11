@@ -24,6 +24,7 @@ pub fn status() -> AdapterStatus {
         bits: usize::BITS,
         diagnostic,
         can_give: false,
+        roll_matched: None,
         message: if diagnostic {
             "Isolated adapter test passed. Dungeon Defenders is not connected; item granting is unavailable."
         } else {

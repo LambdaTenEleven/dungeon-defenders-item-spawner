@@ -15,10 +15,9 @@ the current native bindings. The original game files were not rewritten.
   `5f532d3ecf74d85a74be3c6c36ca986a88da1573909ec8525474743479e1e824`.
 - Package version 679, licensee version 2, LZO compression.
 
-REA supplied identity/provider evidence. Ghidra and IDA were not configured and
-Hopper was unavailable on Windows. Supplemental local format parsing and UELib
-UnrealScript decompilation recovered the script path below; this is not native
-REA decompilation or runtime proof. UELib commit:
+REA supplied artifact identity evidence. Supplemental package-format parsing and
+UELib UnrealScript decompilation recovered the script path below; this is static
+script analysis, not native decompilation or runtime proof. UELib commit:
 `3207a17e9b294be3d1bf26b18e07ccff7e1d4b0c`.
 
 The analysis used decompressed copies and a native-token name table derived from
