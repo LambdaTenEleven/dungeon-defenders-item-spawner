@@ -368,6 +368,7 @@ name = "dd-adapter"
 version = "0.1.0"
 dependencies = [
  "dd-protocol",
+ "sha2",
  "windows-sys 0.61.2",
 ]
 

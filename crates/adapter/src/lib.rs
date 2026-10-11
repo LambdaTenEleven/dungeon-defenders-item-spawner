@@ -1,4 +1,11 @@
-//! Adapter entry point. Game dispatch stays disabled until its ABI is verified.
+//! Diagnostic entry point and build-specific single-player game adapter.
+
+#[cfg(windows)]
+pub mod attachment;
+#[cfg(windows)]
+mod bridge;
+#[cfg(windows)]
+mod engine;
 
 use dd_protocol::{
     AdapterStatus, Command, ErrorCode, Rejection, Request, Response, VERSION, validate_grant,
@@ -18,9 +25,9 @@ pub fn status() -> AdapterStatus {
         diagnostic,
         can_give: false,
         message: if diagnostic {
-            "Adapter test connected. No game process or inventory is modified."
+            "Isolated adapter test passed. Dungeon Defenders is not connected; item granting is unavailable."
         } else {
-            "Game integration is not verified for this build. Item requests are disabled."
+            "Diagnostic entry point only. Use the game attachment helper for engine requests."
         }
         .into(),
     }
@@ -45,7 +52,7 @@ pub fn handle(request: Request) -> Response {
                 Err(message) => rejection(ErrorCode::InvalidRequest, message),
                 Ok(()) => rejection(
                     ErrorCode::IntegrationUnavailable,
-                    "Item granting is not implemented: the game dispatcher and object layouts need verification.",
+                    "Isolated diagnostics cannot spawn items. Use Connect to game from the overlay.",
                 ),
             },
         }

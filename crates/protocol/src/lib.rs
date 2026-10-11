@@ -9,6 +9,8 @@ pub mod pipe;
 pub const VERSION: u32 = 1;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024;
 pub const MAX_QUANTITY: u8 = 10;
+/// Packaged equipment references from the analyzed Startup_INT.upk; no game assets are embedded.
+pub const EQUIPMENT_CATALOG: &str = include_str!("catalog.txt");
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

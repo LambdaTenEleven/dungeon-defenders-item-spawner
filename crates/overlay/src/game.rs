@@ -64,7 +64,7 @@ pub fn inspect(root: &Path) -> io::Result<String> {
     }
     let hash = format!("{:x}", digest.finalize());
     if hash == ANALYZED_SHA256 {
-        Ok("Recognized 32-bit build. Item integration is still in development.".into())
+        Ok("Recognized 32-bit build. Start local single-player, then connect to the game.".into())
     } else {
         Ok(format!(
             "Unrecognized build ({hash}). Item requests are disabled."
@@ -73,7 +73,7 @@ pub fn inspect(root: &Path) -> io::Result<String> {
 }
 
 #[cfg(windows)]
-pub fn running() -> bool {
+pub fn process_ids() -> Vec<u32> {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
         System::Diagnostics::ToolHelp::{
@@ -84,14 +84,14 @@ pub fn running() -> bool {
     // SAFETY: TH32CS_SNAPPROCESS requires no caller pointers; returned handle is checked.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
-        return false;
+        return Vec::new();
     }
     // SAFETY: PROCESSENTRY32W is plain data with no invalid all-zero bit patterns.
     let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
     // SAFETY: snapshot is valid and entry is initialized with its documented size.
     let mut found = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
-    let mut running = false;
+    let mut processes = Vec::new();
     while found {
         let end = entry
             .szExeFile
@@ -100,8 +100,7 @@ pub fn running() -> bool {
             .unwrap_or(entry.szExeFile.len());
         if String::from_utf16_lossy(&entry.szExeFile[..end]).eq_ignore_ascii_case("DunDefGame.exe")
         {
-            running = true;
-            break;
+            processes.push(entry.th32ProcessID);
         }
         // SAFETY: snapshot and entry remain valid throughout enumeration.
         found = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
@@ -110,10 +109,14 @@ pub fn running() -> bool {
     unsafe {
         CloseHandle(snapshot);
     }
-    running
+    processes
 }
 
 #[cfg(not(windows))]
+pub fn process_ids() -> Vec<u32> {
+    Vec::new()
+}
+
 pub fn running() -> bool {
-    false
+    !process_ids().is_empty()
 }

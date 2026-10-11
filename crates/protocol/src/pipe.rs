@@ -82,8 +82,19 @@ impl Pipe {
     }
 
     pub fn accept(&mut self) -> io::Result<()> {
+        self.accept_until(|| false)
+    }
+
+    /// Like `accept`, but permits an idle service to stop without closing another thread's handle.
+    pub fn accept_until(&mut self, cancelled: impl Fn() -> bool) -> io::Result<()> {
         let handle = self.file.as_raw_handle();
         loop {
+            if cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Adapter stopped.",
+                ));
+            }
             // SAFETY: file keeps handle alive; PIPE_NOWAIT permits a null OVERLAPPED.
             if unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0 {
                 break;
@@ -105,6 +116,11 @@ impl Pipe {
         unsafe {
             DisconnectNamedPipe(self.file.as_raw_handle());
         }
+    }
+
+    /// Budget left for the current complete transaction, including frame reception.
+    pub fn remaining_time(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
     }
 }
 

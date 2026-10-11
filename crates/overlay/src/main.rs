@@ -1,9 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod connection;
 mod diagnostics;
 mod game;
 
-use dd_protocol::{AdapterStatus, MAX_QUANTITY, validate_grant};
+use connection::GameConnection;
+use dd_protocol::{AdapterStatus, Command, MAX_QUANTITY, validate_grant};
 use diagnostics::DiagnosticHost;
 use eframe::egui::{self, Color32, RichText};
 use std::{
@@ -18,30 +20,27 @@ struct Template {
     path: &'static str,
 }
 
-const TEMPLATES: &[Template] = &[
-    Template {
-        name: "Sword of Embers",
-        kind: "Weapon",
-        path: "DunDef_CDT_Items.SwordOfEmbers.HeroEquipment_SwordOfEmbers",
-    },
-    Template {
-        name: "Magic staff · style 4",
-        kind: "Weapon",
-        path: "DunDefEquipment.EquipmentMage.MagicStaffStyle4",
-    },
-    Template {
-        name: "Pristine helmet",
-        kind: "Armor",
-        path: "DunDefEquipment.EquipmentGeneric.HelmetArmorBase_Pristine",
-    },
-];
+fn templates() -> Vec<Template> {
+    include_str!("equipment.tsv")
+        .lines()
+        .filter_map(|line| {
+            let (kind, path) = line.split_once('\t')?;
+            let leaf = path.rsplit('.').next()?;
+            let name = leaf.strip_prefix("HeroEquipment_").unwrap_or(leaf);
+            Some(Template { name, kind, path })
+        })
+        .collect()
+}
 
 enum Event {
     Adapter(Result<(DiagnosticHost, AdapterStatus), String>),
     Game(Result<String, String>),
+    Connected(Result<(GameConnection, AdapterStatus), String>),
+    Spawned(Result<AdapterStatus, String>),
 }
 
 struct Overlay {
+    templates: Vec<Template>,
     search: String,
     selected: usize,
     template: String,
@@ -51,6 +50,8 @@ struct Overlay {
     game_running: bool,
     adapter_status: String,
     diagnostic: Option<DiagnosticHost>,
+    connection: Option<GameConnection>,
+    can_spawn: bool,
     busy: bool,
     topmost: bool,
     tx: mpsc::Sender<Event>,
@@ -62,18 +63,27 @@ impl Overlay {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let (tx, rx) = mpsc::channel();
+        let templates = templates();
+        let selected = templates
+            .iter()
+            .position(|item| item.name == "SwordOfEmbers")
+            .unwrap_or(0);
+        let template = templates[selected].path.into();
         let mut app = Self {
+            templates,
             search: String::new(),
-            selected: 0,
-            template: TEMPLATES[0].path.into(),
+            selected,
+            template,
             quantity: 1,
             install_path: game::find_installation()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             game_status: "Select your Dungeon Defenders folder.".into(),
             game_running: game::running(),
-            adapter_status: "Not connected".into(),
+            adapter_status: "Start local single-player and connect to the game.".into(),
             diagnostic: None,
+            connection: None,
+            can_spawn: false,
             busy: false,
             topmost: true,
             tx,
@@ -99,12 +109,47 @@ impl Overlay {
     }
 
     fn test_adapter(&mut self, context: egui::Context) {
+        self.connection = None;
+        self.can_spawn = false;
         self.diagnostic = None;
         self.busy = true;
-        self.adapter_status = "Starting the 32-bit adapter test…".into();
+        self.adapter_status = "Starting the isolated 32-bit adapter test…".into();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(Event::Adapter(DiagnosticHost::start()));
+            context.request_repaint();
+        });
+    }
+
+    fn connect(&mut self, context: egui::Context) {
+        self.diagnostic = None;
+        self.connection = None;
+        self.can_spawn = false;
+        self.busy = true;
+        self.adapter_status =
+            "Connecting and checking the game. The first connection may briefly pause gameplay…"
+                .into();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Event::Connected(GameConnection::start()));
+            context.request_repaint();
+        });
+    }
+
+    fn spawn_item(&mut self, context: egui::Context) {
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        let pid = connection.pid;
+        let command = Command::Give {
+            template: self.template.clone(),
+            quantity: self.quantity,
+        };
+        self.busy = true;
+        self.adapter_status = "Spawning pickup…".into();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Event::Spawned(connection::request(pid, command)));
             context.request_repaint();
         });
     }
@@ -124,18 +169,42 @@ impl eframe::App for Overlay {
                     self.diagnostic = Some(host);
                 }
                 Event::Adapter(Err(error)) => self.adapter_status = error,
+                Event::Connected(Ok((connection, status))) => {
+                    self.can_spawn = status.can_give;
+                    self.adapter_status = status.message;
+                    self.connection = Some(connection);
+                }
+                Event::Connected(Err(error)) => self.adapter_status = error,
+                Event::Spawned(Ok(status)) => {
+                    self.can_spawn = status.can_give;
+                    self.adapter_status = status.message;
+                }
+                Event::Spawned(Err(error)) => {
+                    self.adapter_status = error;
+                    self.can_spawn = false;
+                }
             }
         }
         if self.last_process_check.elapsed() > Duration::from_secs(2) {
             self.game_running = game::running();
             self.last_process_check = Instant::now();
             if self
+                .connection
+                .as_mut()
+                .is_some_and(|connection| !connection.is_running())
+            {
+                self.connection = None;
+                self.can_spawn = false;
+                self.adapter_status =
+                    "Game attachment ended. Connect again when the game is ready.".into();
+            }
+            if self
                 .diagnostic
                 .as_mut()
                 .is_some_and(|host| !host.is_running())
             {
                 self.diagnostic = None;
-                self.adapter_status = "Adapter test stopped. You can reconnect.".into();
+                self.adapter_status = "Isolated adapter test stopped. You can run it again.".into();
             }
         }
         ui.ctx().request_repaint_after(Duration::from_millis(250));
@@ -148,7 +217,7 @@ impl eframe::App for Overlay {
             ui.label("Equipment tools for Dungeon Defenders single-player");
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.label(if self.game_running { "● Game detected" } else { "○ Game not running" });
+                ui.label(if self.connection.is_some() { "● Game adapter connected" } else if self.game_running { "● Game running · not attached" } else { "○ Game not running" });
                 ui.separator();
                 if ui.checkbox(&mut self.topmost, "Keep on top").changed() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.topmost {
@@ -162,17 +231,20 @@ impl eframe::App for Overlay {
             ui.columns(2, |columns| {
                 let left = &mut columns[0];
                 left.heading("Equipment");
-                left.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search starter templates…").desired_width(f32::INFINITY));
+                left.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search weapons, armor, or package…").desired_width(f32::INFINITY));
                 left.add_space(8.0);
-                for (index, item) in TEMPLATES.iter().enumerate() {
-                    if !format!("{} {}", item.name, item.kind).to_lowercase().contains(&self.search.to_lowercase()) { continue; }
-                    if left.selectable_label(self.selected == index, format!("{}  ·  {}", item.name, item.kind)).clicked() {
+                let search = self.search.to_lowercase();
+                egui::ScrollArea::vertical().max_height(170.0).auto_shrink([false, false]).show(left, |ui| {
+                for (index, item) in self.templates.iter().enumerate() {
+                    if !format!("{} {}", item.path, item.kind).to_lowercase().contains(&search) { continue; }
+                    if ui.selectable_label(self.selected == index, format!("{}  ·  {}", item.name, item.kind)).on_hover_text(item.path).clicked() {
                         self.selected = index;
                         self.template = item.path.into();
                     }
                 }
+                });
                 left.add_space(16.0);
-                left.label(RichText::new("Starter references from the installed game. Availability still needs in-game verification.").small().weak());
+                left.label(RichText::new(format!("{} weapon and armor references. Availability is checked when spawning; not every template has been tested.", self.templates.len())).small().weak());
 
                 let right = &mut columns[1];
                 right.heading("Item request");
@@ -186,8 +258,8 @@ impl eframe::App for Overlay {
                     right.colored_label(Color32::from_rgb(240, 150, 120), error);
                 }
                 right.add_space(10.0);
-                right.add_enabled(false, egui::Button::new("Give item").min_size(egui::vec2(160.0, 34.0)));
-                right.label("Item granting is not available in this preview. Native game integration is the next step.");
+                if right.add_enabled(self.can_spawn && !self.busy && validate_grant(&self.template, self.quantity).is_ok(), egui::Button::new("Spawn pickup").min_size(egui::vec2(160.0, 34.0))).clicked() { self.spawn_item(right.ctx().clone()); }
+                right.label("Creates equipment near your hero with its template stats. Pick it up normally to equip or store it.");
             });
             ui.add_space(16.0);
             ui.separator();
@@ -200,17 +272,25 @@ impl eframe::App for Overlay {
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.add_enabled(!self.busy, egui::Button::new("Test adapter connection")).clicked() {
+                if ui.add_enabled(!self.busy, egui::Button::new(if self.connection.is_some() { "Reconnect to game" } else { "Connect to game" })).clicked() { self.connect(ui.ctx().clone()); }
+                if self.connection.is_some() && ui.add_enabled(!self.busy, egui::Button::new("Disconnect game")).clicked() {
+                    self.connection = None;
+                    self.can_spawn = false;
+                    self.adapter_status = "Game disconnected. Adapter stays idle until the game exits.".into();
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!self.busy, egui::Button::new("Run isolated adapter test")).clicked() {
                     self.test_adapter(ui.ctx().clone());
                 }
-                if self.diagnostic.is_some() && ui.button("Disconnect test").clicked() {
+                if self.diagnostic.is_some() && ui.button("Stop test host").clicked() {
                     self.diagnostic = None;
-                    self.adapter_status = "Not connected".into();
+                    self.adapter_status = "Isolated adapter test stopped. Game is not connected.".into();
                 }
             });
             ui.label(&self.adapter_status);
             ui.add_space(6.0);
-            ui.label(RichText::new("This preview does not attach to the game or change items, saves, or game files.").small().weak());
+            ui.label(RichText::new("Local single-player only. Picked-up items can be saved by the game. Restart the game before replacing an attached adapter DLL.").small().weak());
         });
     }
 }
@@ -233,8 +313,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([820.0, 590.0])
-            .with_min_inner_size([680.0, 540.0])
+            .with_inner_size([820.0, 690.0])
+            .with_min_inner_size([680.0, 650.0])
             .with_always_on_top(),
         ..Default::default()
     };

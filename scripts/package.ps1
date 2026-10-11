@@ -23,6 +23,7 @@ try {
     $docsDirectory = Join-Path $packageDirectory 'docs'
     New-Item -ItemType Directory -Path $docsDirectory | Out-Null
     Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\integration.md') -Destination $docsDirectory
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\runtime-verification.md') -Destination $docsDirectory
 
     $testLog = Join-Path $OutputDirectory 'adapter-smoke.stdout.log'
     $errorLog = Join-Path $OutputDirectory 'adapter-smoke.stderr.log'

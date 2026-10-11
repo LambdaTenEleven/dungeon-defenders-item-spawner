@@ -1,6 +1,9 @@
 # Native integration status
 
-Investigation date: 2026-10-11. Static analysis only; no game process was modified.
+Initial investigation: 2026-10-11. This document preserves the original static
+item-box investigation. The subsequent implementation uses a verified floor-pickup
+route; see [runtime verification](runtime-verification.md) for live evidence and
+the current native bindings. The original game files were not rewritten.
 
 ## Analyzed build
 
@@ -70,19 +73,20 @@ Details that the eventual adapter must preserve:
 - The mode enum contains unranked, ranked and non-Steam states. A mode check alone
   does not prove standalone gameplay; verify world/network and local ownership.
 
-## What remains unknown
+## Original unknowns and subsequent implementation
 
-No verified native dispatcher address, vtable slot, global object table, live
-property offsets, game-thread hook, or loading/attachment mechanism is available
-yet. Do not borrow offsets from another Unreal game or treat package export
-indices as virtual addresses. Native methods must use the exact x86 calling
-convention and verified parameter/return/out layouts. Engine-owned strings and
-objects also require engine lifetime management.
+The initial investigation did not establish native bindings. Supplemental native
+analysis and live reflection have since verified the dispatcher, globals, layouts,
+and game-thread identity for this build. The adapter now invokes
+`ServerCreateDroppedEquipment`, which takes object references and scalar parameters;
+the game creates its own EquipmentNetInfo and equipment object. Direct item-box
+insertion remains unimplemented. Package export indices are not virtual addresses.
 
-The current adapter therefore exposes only diagnostic status and rejects grants.
-It exports an explicit `dd_adapter_run` entry point; the isolated host calls it
-after `LoadLibraryExW` returns. No work is performed under `DllMain`, and the host
-unloads the DLL only after its service returns with no background threads.
+The isolated `dd_adapter_run` diagnostic still rejects grants. The separate
+`dd_adapter_hook` entry point services actual game requests through the verified
+window message thread. No work runs under `DllMain`. The game-side module is
+pinned until game exit; the diagnostic host can still unload its own copy after
+the synchronous service returns.
 
 An UnrealScript/TcpLink mod adapter is an alternative for custom maps, but does
 not meet the chosen regular-map workflow. The production direction remains an

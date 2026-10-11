@@ -14,6 +14,7 @@ path = "src/bin/host.rs"
 
 [dependencies]
 dd-protocol.workspace = true
+sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

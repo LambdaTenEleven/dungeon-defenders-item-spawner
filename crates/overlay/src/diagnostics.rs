@@ -95,7 +95,7 @@ pub fn self_test() -> Result<(), String> {
     if !matches!(grant.result, Err(ref e) if e.code == ErrorCode::IntegrationUnavailable) {
         return Err("Unverified item grant did not fail closed.".into());
     }
-    println!("PASS: valid item request rejected while engine integration is unavailable");
+    println!("PASS: valid item request rejected in the isolated diagnostic host");
     let mut incompatible = Request::new(4, Command::Status {});
     incompatible.version += 1;
     let response = host.send(incompatible)?;
