@@ -4,6 +4,7 @@ mod connection;
 mod diagnostics;
 mod editor;
 mod game;
+mod number_input;
 
 use connection::GameConnection;
 use dd_protocol::{AdapterStatus, Command, MAX_QUANTITY, validate_grant};
@@ -45,7 +46,7 @@ struct Overlay {
     search: String,
     selected: usize,
     template: String,
-    quantity: u8,
+    quantity: i32,
     editor: editor::ItemEditor,
     install_path: String,
     game_status: String,
@@ -146,6 +147,10 @@ impl Overlay {
             .is_none_or(|item| item.kind == "Weapon")
     }
 
+    fn request_quantity(&self) -> u8 {
+        u8::try_from(self.quantity).unwrap_or(0)
+    }
+
     fn spawn_item(&mut self, context: egui::Context) {
         let Some(connection) = &self.connection else {
             return;
@@ -153,7 +158,7 @@ impl Overlay {
         let pid = connection.pid;
         let command = Command::Give {
             template: self.template.clone(),
-            quantity: self.quantity,
+            quantity: self.request_quantity(),
             options: self.editor.options(self.is_weapon()),
         };
         self.busy = true;
@@ -264,12 +269,13 @@ impl eframe::App for Overlay {
                 right.add(egui::TextEdit::multiline(&mut self.template).desired_rows(3).desired_width(f32::INFINITY));
                 right.horizontal(|ui| {
                     ui.label("Quantity");
-                    ui.add(egui::DragValue::new(&mut self.quantity).range(1..=MAX_QUANTITY));
+                    number_input::number_input(ui, "quantity", &mut self.quantity, i32::MIN)
+                        .on_hover_text(format!("Enter a whole number between 1 and {MAX_QUANTITY}."));
                 });
                 right.add_space(8.0);
                 let weapon = self.is_weapon();
                 self.editor.show(right, weapon);
-                let valid = validate_grant(&self.template, self.quantity).and_then(|()| self.editor.options(weapon).validate());
+                let valid = validate_grant(&self.template, self.request_quantity()).and_then(|()| self.editor.options(weapon).validate());
                 if let Err(error) = valid {
                     right.colored_label(Color32::from_rgb(240, 150, 120), error);
                 }

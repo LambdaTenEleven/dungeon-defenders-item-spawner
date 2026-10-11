@@ -1,3 +1,4 @@
+use crate::number_input::number_input;
 use dd_protocol::{
     CustomItem, ItemOptions, Quality,
     items::{DAMAGE_LIMIT, HERO_STATS, STAT_LIMIT, UPGRADE_LIMIT},
@@ -38,7 +39,8 @@ fn optional(ui: &mut egui::Ui, label: &str, value: &mut Option<i32>, min: i32, m
         *value = enabled.then_some(min.max(0));
     }
     if let Some(value) = value {
-        ui.add(egui::DragValue::new(value).range(min..=max));
+        number_input(ui, label, value, i32::MIN)
+            .on_hover_text(format!("Enter a whole number between {min} and {max}."));
     } else {
         ui.weak("Template");
     }
@@ -84,7 +86,11 @@ impl ItemEditor {
                 ui.label("Use the selected equipment's default values.");
             }
             Mode::Random => {
-                ui.add(egui::Slider::new(&mut self.strength, 0.01..=2.0).text("Roll strength"));
+                ui.horizontal(|ui| {
+                    ui.label("Roll strength");
+                    number_input(ui, "roll-strength", &mut self.strength, f32::NAN)
+                        .on_hover_text("Enter a number between 0.01 and 2.0.");
+                });
                 ui.label("The game rolls stats and quality. Strength does not guarantee a rarity; template and map rules still apply.");
             }
             Mode::Custom => {

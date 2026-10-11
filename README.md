@@ -33,6 +33,10 @@ controls are **bonuses**, not final displayed totals; a weapon may not use every
 bonus. Elemental damage keeps the template's element. Special items can retain
 their fixed name and beam color even with a different quality tier.
 
+Type quantities, roll strength and custom values directly into their text boxes.
+Dragging selects text without changing the number. Empty, incomplete and
+out-of-range entries disable spawning until corrected.
+
 The editor bounds hero bonuses to ±9999, damage/ammo to 0–1000000, projectile
 speed bonus to ±1000000, resistances to 0–100, and upgrades to 1–9999. These are
 tool limits, not normal loot caps. Small weapon bonuses are limited to −127–128
