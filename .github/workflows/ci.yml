@@ -1,0 +1,24 @@
+name: Rust checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust targets
+        run: rustup show
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+      - run: cargo clippy --locked -p dd-adapter --all-targets --target i686-pc-windows-msvc -- -D warnings
+      - name: Package and test actual x86 DLL
+        shell: pwsh
+        run: ./scripts/package.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DungeonWorkshop-preview-windows
+          path: |
+            dist/*.zip
+            dist/*.sha256

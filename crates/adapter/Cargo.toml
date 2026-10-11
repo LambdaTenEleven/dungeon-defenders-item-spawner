@@ -1,0 +1,22 @@
+[package]
+name = "dd-adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "dd-adapter-host"
+path = "src/bin/host.rs"
+
+[dependencies]
+dd-protocol.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[lints]
+workspace = true
