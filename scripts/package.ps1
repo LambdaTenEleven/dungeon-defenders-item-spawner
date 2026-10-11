@@ -28,6 +28,8 @@ try {
     $testLog = Join-Path $OutputDirectory 'adapter-smoke.stdout.log'
     $errorLog = Join-Path $OutputDirectory 'adapter-smoke.stderr.log'
     $testProcess = Start-Process -FilePath (Join-Path $packageDirectory 'dd-overlay.exe') -ArgumentList '--self-test' -WindowStyle Hidden -RedirectStandardOutput $testLog -RedirectStandardError $errorLog -PassThru
+    # Keep the native handle open so Windows PowerShell retains the exit code.
+    $null = $testProcess.Handle
     if (-not $testProcess.WaitForExit(20000)) {
         $testProcess.Kill()
         throw 'Adapter smoke test timed out.'

@@ -74,19 +74,13 @@ impl ItemEditor {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, weapon: bool, stats_height: f32) {
-        ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
-        egui::ComboBox::from_id_salt("item-mode")
-            .selected_text(match self.mode {
-                Mode::Template => "Template defaults",
-                Mode::Random => "Random roll",
-                Mode::Custom => "Custom",
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.mode, Mode::Template, "Template defaults");
-                ui.selectable_value(&mut self.mode, Mode::Random, "Random roll");
-                ui.selectable_value(&mut self.mode, Mode::Custom, "Custom");
-            });
+    pub fn show(&mut self, ui: &mut egui::Ui, weapon: bool) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.mode, Mode::Template, "Template defaults");
+            ui.selectable_value(&mut self.mode, Mode::Random, "Random roll");
+            ui.selectable_value(&mut self.mode, Mode::Custom, "Custom");
+        });
+        ui.add_space(4.0);
         match self.mode {
             Mode::Template => {
                 ui.label("Use the selected equipment's default values.");
@@ -158,43 +152,58 @@ impl ItemEditor {
                     }
                 });
                 ui.small("Check a field to override it. Unchecked fields keep template values.");
-                egui::ScrollArea::vertical().id_salt("custom-stats").max_height(stats_height).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).show(ui, |ui| {
-                    egui::CollapsingHeader::new("Upgrades").default_open(true).show(ui, |ui| {
+                egui::CollapsingHeader::new("Upgrades")
+                    .default_open(true)
+                    .show(ui, |ui| {
                         egui::Grid::new("upgrades").num_columns(2).show(ui, |ui| {
-                            optional(ui, "Current level", &mut self.custom.upgrade_level, 1, UPGRADE_LIMIT);
-                            optional(ui, "Maximum upgrades", &mut self.custom.max_upgrades, 1, UPGRADE_LIMIT);
+                            optional(
+                                ui,
+                                "Current level",
+                                &mut self.custom.upgrade_level,
+                                1,
+                                UPGRADE_LIMIT,
+                            );
+                            optional(
+                                ui,
+                                "Maximum upgrades",
+                                &mut self.custom.max_upgrades,
+                                1,
+                                UPGRADE_LIMIT,
+                            );
                         });
                     });
-                    egui::CollapsingHeader::new("Hero and defense bonuses").default_open(false).show(ui, |ui| {
+                egui::CollapsingHeader::new("Hero and defense bonuses")
+                    .default_open(false)
+                    .show(ui, |ui| {
                         egui::Grid::new("hero-stats").num_columns(2).show(ui, |ui| {
-                            for (label, value) in HERO_STATS.iter().zip(&mut self.custom.hero_stats) {
+                            for (label, value) in HERO_STATS.iter().zip(&mut self.custom.hero_stats)
+                            {
                                 optional(ui, label, value, -STAT_LIMIT, STAT_LIMIT);
                             }
                         });
                     });
-                    egui::CollapsingHeader::new(if weapon { "Weapon bonuses" } else { "Armor resistances" }).default_open(true).show(ui, |ui| {
+                egui::CollapsingHeader::new(if weapon { "Weapon bonuses" } else { "Armor resistances" }).default_open(true).show(ui, |ui| {
+                    if weapon {
+                        ui.small("Bonuses are added to the weapon's base values. Displayed totals and supported effects vary by weapon.");
+                    }
+                    egui::Grid::new("equipment-stats").num_columns(2).show(ui, |ui| {
                         if weapon {
-                            ui.small("Bonuses are added to the weapon's base values. Displayed totals and supported effects vary by weapon.");
-                        }
-                        egui::Grid::new("equipment-stats").num_columns(2).show(ui, |ui| {
-                            if weapon {
-                                let w = &mut self.custom.weapon;
-                                optional(ui, "Damage bonus", &mut w.damage, 0, DAMAGE_LIMIT);
-                                optional(ui, "Elemental damage bonus", &mut w.elemental_damage, 0, DAMAGE_LIMIT);
-                                optional(ui, "Projectile count bonus", &mut w.projectiles, -127, 128);
-                                optional(ui, "Projectile speed bonus", &mut w.projectile_speed, -DAMAGE_LIMIT, DAMAGE_LIMIT);
-                                optional(ui, "Attack rate bonus", &mut w.attack_rate, -127, 128);
-                                optional(ui, "Ammo bonus", &mut w.clip_ammo, 0, DAMAGE_LIMIT);
-                                optional(ui, "Reload bonus", &mut w.reload, -127, 128);
-                                optional(ui, "Knockback bonus", &mut w.knockback, -127, 128);
-                                optional(ui, "Charge speed bonus", &mut w.charge_speed, -127, 128);
-                                optional(ui, "Blocking bonus", &mut w.blocking, -127, 128);
-                            } else {
-                                for (label, value) in ["Physical %", "Fire %", "Lightning %", "Poison %"].iter().zip(&mut self.custom.resistances) {
-                                    optional(ui, label, value, 0, 100);
-                                }
+                            let w = &mut self.custom.weapon;
+                            optional(ui, "Damage bonus", &mut w.damage, 0, DAMAGE_LIMIT);
+                            optional(ui, "Elemental damage bonus", &mut w.elemental_damage, 0, DAMAGE_LIMIT);
+                            optional(ui, "Projectile count bonus", &mut w.projectiles, -127, 128);
+                            optional(ui, "Projectile speed bonus", &mut w.projectile_speed, -DAMAGE_LIMIT, DAMAGE_LIMIT);
+                            optional(ui, "Attack rate bonus", &mut w.attack_rate, -127, 128);
+                            optional(ui, "Ammo bonus", &mut w.clip_ammo, 0, DAMAGE_LIMIT);
+                            optional(ui, "Reload bonus", &mut w.reload, -127, 128);
+                            optional(ui, "Knockback bonus", &mut w.knockback, -127, 128);
+                            optional(ui, "Charge speed bonus", &mut w.charge_speed, -127, 128);
+                            optional(ui, "Blocking bonus", &mut w.blocking, -127, 128);
+                        } else {
+                            for (label, value) in ["Physical %", "Fire %", "Lightning %", "Poison %"].iter().zip(&mut self.custom.resistances) {
+                                optional(ui, label, value, 0, 100);
                             }
-                        });
+                        }
                     });
                 });
             }

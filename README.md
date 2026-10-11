@@ -11,16 +11,22 @@ been individually tested. Choose template defaults, a game-generated random roll
 or custom quality and stat overrides. Custom weapon and armor values have been
 read back after normal pickup into the item box.
 
+![Dungeon Workshop window](docs/window.png)
+
 ## Run the preview
 
 1. Extract the complete portable ZIP into any writable folder.
 2. Start Dungeon Defenders and enter a regular **local single-player** map/tavern.
-3. Run `dd-overlay.exe` and click **Connect to game**. The first connection briefly
-   pauses gameplay while inspecting reflection metadata.
-4. Search/select equipment and choose **Template defaults**, **Random roll**, or
-   **Custom**. Choose quantity and click **Spawn pickup**.
+3. Run `dd-overlay.exe` and click **Connect to game** in the top bar. The first
+   connection briefly pauses gameplay while inspecting reflection metadata.
+4. Search or filter the equipment list on the left, select an item, and choose
+   **Template defaults**, **Random roll**, or **Custom**. Choose quantity and click
+   **Spawn pickup**.
 5. Pick it up in-game to equip or store it. Collected items appear in your item
    box. Normal game saves can retain picked-up items.
+
+Install path, disconnect and the isolated adapter test are under **Settings**.
+Status and search progress appear in the bar at the bottom of the window.
 
 In **Random roll**, choose **Any** quality for an ordinary roll, or select a tier
 to search naturally generated rolls for an exact match. The strength slider
@@ -65,7 +71,7 @@ because larger values wrap in the game's serialization. The adapter also checks
 template minimum damage/upgrades and rejects a current level above the maximum.
 Leave both upgrade fields unchecked to preserve template defaults.
 
-This release uses protocol version 4. Keep the three matching binaries together;
+Keep the three matching binaries together;
 restart the game before replacing an older attached adapter.
 
 **Run isolated adapter test** is a separate diagnostic; it never connects to the
@@ -98,21 +104,36 @@ the extracted folder. Nothing is installed into the game's directory.
 
 ## Build
 
-Windows 10/11 x64, Rust 1.99.0, and Visual Studio Build Tools with the x86/x64 C++
-tools and Windows SDK are required for building. The Rust toolchain file pins the
-compiler and targets. End users do not need these development tools.
+Windows 10/11 x64 is required. Install these development tools once:
+
+1. Install [Rust using rustup](https://rust-lang.org/tools/install/) with the MSVC
+   toolchain. Rust lives in `%USERPROFILE%\.cargo` and `%USERPROFILE%\.rustup`.
+2. In Visual Studio Installer, install or modify **Build Tools 2022**, selecting
+   **MSVC v143 C++ x64/x86 build tools** and **Windows 11 SDK (10.0.22621.0)**.
+   These are installed in the standard Program Files locations.
+
+The repository's `rust-toolchain.toml` selects Rust 1.99.0, rustfmt, Clippy, and
+both Windows MSVC targets. Rustup downloads missing components on first use.
+End users of the portable ZIP do not need development tools.
+
+Double-click **build.cmd**, or run this command from the repository:
 
 ```powershell
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-powershell -ExecutionPolicy Bypass -File scripts/package.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-`scripts/package.ps1` builds the x64 overlay and x86 adapter/host, runs the DLL
-integration smoke test, and produces a portable ZIP and SHA-256 checksum in
-`dist/`. The CRT is linked statically. The script packages an explicit list of
-files, never game binaries or assets.
+The script checks formatting, runs Clippy for the overlay and 32-bit adapter,
+runs workspace tests, and builds and tests the release package. Each build goes
+into a new timestamped folder under `dist/`, containing the portable ZIP and its
+SHA-256 checksum. Compilation is cached in `target/`. No Codex folder or tools
+are required. The first build needs internet access to download Rust components
+and Cargo dependencies.
+
+Optionally pass `-OutputDirectory <fresh-folder>` to choose an output location.
+For packaging without the initial formatting, Clippy, and unit-test checks, use
+`scripts/package.ps1 -OutputDirectory <fresh-folder>`; this still runs the adapter
+smoke and transport tests. The CRT is linked statically. Packaging uses an
+explicit file list and never includes game binaries or assets.
 
 To test an extracted release without opening a window:
 

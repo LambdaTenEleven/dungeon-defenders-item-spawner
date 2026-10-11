@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod catalog;
 mod connection;
 mod diagnostics;
 mod editor;
@@ -7,11 +8,13 @@ mod game;
 mod number_input;
 mod search;
 
+use catalog::{Filter, Kind, Template};
 use connection::GameConnection;
 use dd_protocol::{AdapterStatus, Command, MAX_QUANTITY, validate_grant};
 use diagnostics::DiagnosticHost;
 use eframe::egui::{self, Color32, RichText};
 use std::{
+    collections::BTreeSet,
     path::Path,
     sync::{
         Arc,
@@ -21,23 +24,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-struct Template {
-    name: &'static str,
-    kind: &'static str,
-    path: &'static str,
-}
-
-fn templates() -> Vec<Template> {
-    include_str!("equipment.tsv")
-        .lines()
-        .filter_map(|line| {
-            let (kind, path) = line.split_once('\t')?;
-            let leaf = path.rsplit('.').next()?;
-            let name = leaf.strip_prefix("HeroEquipment_").unwrap_or(leaf);
-            Some(Template { name, kind, path })
-        })
-        .collect()
-}
+const WARNING: Color32 = Color32::from_rgb(232, 187, 96);
+const ERROR: Color32 = Color32::from_rgb(240, 150, 120);
+const CONNECTED: Color32 = Color32::from_rgb(120, 200, 140);
 
 enum Event {
     Progress(String),
@@ -49,8 +38,11 @@ enum Event {
 
 struct Overlay {
     templates: Vec<Template>,
-    search: String,
-    selected: usize,
+    filter: Filter,
+    /// Template indices matching `filter`, rebuilt only when the filter changes.
+    shown: Vec<usize>,
+    shown_for: Filter,
+    /// Requested template path. Selecting from the list sets it; it can also be edited.
     template: String,
     quantity: i32,
     editor: editor::ItemEditor,
@@ -64,6 +56,7 @@ struct Overlay {
     busy: bool,
     search_cancel: Option<Arc<AtomicBool>>,
     topmost: bool,
+    show_settings: bool,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
     last_process_check: Instant,
@@ -73,16 +66,19 @@ impl Overlay {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let (tx, rx) = mpsc::channel();
-        let templates = templates();
-        let selected = templates
+        let templates = catalog::templates();
+        let template = templates
             .iter()
-            .position(|item| item.name == "SwordOfEmbers")
-            .unwrap_or(0);
-        let template = templates[selected].path.into();
+            .find(|item| item.name == "SwordOfEmbers")
+            .unwrap_or(&templates[0])
+            .path
+            .into();
+        let filter = Filter::default();
         let mut app = Self {
+            shown: filter.apply(&templates),
+            shown_for: filter.clone(),
+            filter,
             templates,
-            search: String::new(),
-            selected,
             template,
             quantity: 1,
             editor: editor::ItemEditor::default(),
@@ -98,6 +94,7 @@ impl Overlay {
             busy: false,
             search_cancel: None,
             topmost: true,
+            show_settings: false,
             tx,
             rx,
             last_process_check: Instant::now(),
@@ -148,11 +145,15 @@ impl Overlay {
         });
     }
 
-    fn is_weapon(&self) -> bool {
+    /// The catalog entry for the requested path, if it was not edited to an unknown template.
+    fn current(&self) -> Option<&Template> {
         self.templates
             .iter()
             .find(|item| item.path == self.template)
-            .is_none_or(|item| item.kind == "Weapon")
+    }
+
+    fn is_weapon(&self) -> bool {
+        self.current().is_none_or(|item| item.kind == Kind::Weapon)
     }
 
     fn request_quantity(&self) -> u8 {
@@ -261,103 +262,266 @@ impl eframe::App for Overlay {
             }
         }
         ui.ctx().request_repaint_after(Duration::from_millis(250));
+        egui::Panel::top("top-bar").show(ui, |ui| self.top_bar(ui));
+        egui::Panel::bottom("status-bar").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.label(&self.adapter_status);
+            ui.add_space(2.0);
+        });
+        egui::Panel::left("equipment")
+            .resizable(true)
+            .default_size(380.0)
+            .min_size(260.0)
+            .show(ui, |ui| self.browser(ui));
         egui::CentralPanel::default().show(ui, |ui| {
-            let equipment_height = (ui.available_height() - 330.0).max(140.0);
-            egui::ScrollArea::vertical().id_salt("main-panel").show(ui, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.heading("Dungeon Workshop");
-                ui.label(RichText::new("DEVELOPMENT PREVIEW").small().color(Color32::from_rgb(232, 187, 96)));
-            });
-            ui.label("Equipment tools for Dungeon Defenders single-player");
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(if self.connection.is_some() { "● Game adapter connected" } else if self.game_running { "● Game running · not attached" } else { "○ Game not running" });
-                ui.separator();
-                if ui.checkbox(&mut self.topmost, "Keep on top").changed() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.topmost {
-                        egui::WindowLevel::AlwaysOnTop
-                    } else { egui::WindowLevel::Normal }));
-                }
-                if self.busy { ui.spinner(); }
-            });
+            egui::Panel::bottom("spawn-bar").show(ui, |ui| self.spawn_bar(ui));
+            egui::ScrollArea::vertical()
+                .id_salt("item-details")
+                .auto_shrink([false, false])
+                .show(ui, |ui| self.details(ui));
+        });
+    }
+}
+
+impl Overlay {
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.heading("Dungeon Workshop");
+            ui.label(RichText::new("DEVELOPMENT PREVIEW").small().color(WARNING));
             ui.separator();
-            ui.add_space(8.0);
-            ui.columns(2, |columns| {
-                let left = &mut columns[0];
-                left.heading("Equipment");
-                left.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search weapons, armor, or package…").desired_width(f32::INFINITY));
-                left.add_space(8.0);
-                let search = self.search.to_lowercase();
-                egui::ScrollArea::vertical().max_height(equipment_height).auto_shrink([false, false]).show(left, |ui| {
-                for (index, item) in self.templates.iter().enumerate() {
-                    if !format!("{} {}", item.path, item.kind).to_lowercase().contains(&search) { continue; }
-                    if ui.selectable_label(self.selected == index, format!("{}  ·  {}", item.name, item.kind)).on_hover_text(item.path).clicked() {
-                        self.selected = index;
+            let (status, color) = if self.connection.is_some() {
+                ("Connected", CONNECTED)
+            } else if self.game_running {
+                ("Game running · not attached", WARNING)
+            } else {
+                ("Game not running", ui.visuals().weak_text_color())
+            };
+            // The default fonts have no filled-circle glyph, so paint the status dot.
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+            ui.painter().circle_filled(dot.center(), 4.0, color);
+            ui.colored_label(color, status);
+            if self.busy {
+                ui.spinner();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.toggle_value(&mut self.show_settings, "Settings");
+                if ui.checkbox(&mut self.topmost, "Keep on top").changed() {
+                    let level = if self.topmost {
+                        egui::WindowLevel::AlwaysOnTop
+                    } else {
+                        egui::WindowLevel::Normal
+                    };
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                }
+                let connect = if self.connection.is_some() {
+                    "Reconnect"
+                } else {
+                    "Connect to game"
+                };
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new(connect))
+                    .clicked()
+                {
+                    self.connect(ui.ctx().clone());
+                }
+            });
+        });
+        if self.show_settings {
+            ui.separator();
+            self.settings(ui);
+        }
+        ui.add_space(4.0);
+    }
+
+    fn settings(&mut self, ui: &mut egui::Ui) {
+        ui.label("Game installation");
+        ui.horizontal(|ui| {
+            let width = ui.available_width() - 86.0;
+            ui.add(egui::TextEdit::singleline(&mut self.install_path).desired_width(width));
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Check"))
+                .clicked()
+            {
+                self.inspect_game(ui.ctx().clone());
+            }
+        });
+        ui.label(&self.game_status);
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let disconnect = egui::Button::new("Disconnect game");
+            if self.connection.is_some() && ui.add_enabled(!self.busy, disconnect).clicked() {
+                self.connection = None;
+                self.can_spawn = false;
+                self.adapter_status =
+                    "Game disconnected. Adapter stays idle until the game exits.".into();
+            }
+            let test = egui::Button::new("Run isolated adapter test");
+            if ui.add_enabled(!self.busy, test).clicked() {
+                self.test_adapter(ui.ctx().clone());
+            }
+            if self.diagnostic.is_some() && ui.button("Stop test host").clicked() {
+                self.diagnostic = None;
+                self.adapter_status =
+                    "Isolated adapter test stopped. Game is not connected.".into();
+            }
+        });
+        ui.small("Local single-player only. Picked-up items can be saved by the game. Restart the game before replacing an attached adapter DLL.");
+    }
+
+    fn browser(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.filter.text)
+                .hint_text("Search name or package…")
+                .desired_width(f32::INFINITY),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let mut kind = self.filter.kind;
+            ui.selectable_value(&mut kind, None, "All");
+            ui.selectable_value(&mut kind, Some(Kind::Weapon), "Weapons");
+            ui.selectable_value(&mut kind, Some(Kind::Armor), "Armor");
+            self.filter.set_kind(kind);
+        });
+        if let Some(kind) = self.filter.kind {
+            let filter = &mut self.filter;
+            chips(ui, kind.group_title(), kind.groups(), &mut filter.groups);
+            chips(
+                ui,
+                kind.variant_title(),
+                kind.variants(),
+                &mut filter.variants,
+            );
+        } else {
+            ui.weak("Choose Weapons or Armor to filter by hero, slot, variant, or material.");
+        }
+        ui.horizontal(|ui| {
+            if self.filter.is_active() && ui.small_button("Clear filters").clicked() {
+                self.filter = Filter::default();
+            }
+            if self.shown_for != self.filter {
+                self.shown = self.filter.apply(&self.templates);
+                self.shown_for = self.filter.clone();
+            }
+            let count = format!("{} of {} shown", self.shown.len(), self.templates.len());
+            ui.weak(count).on_hover_text(
+                "Availability is checked when spawning; not every template has been tested.",
+            );
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("equipment-list")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if self.shown.is_empty() {
+                    ui.weak("No equipment matches. Clear a filter to see more.");
+                }
+                for &index in &self.shown {
+                    let item = &self.templates[index];
+                    let selected = self.template == item.path;
+                    let row = ui.horizontal(|ui| {
+                        let name = ui.selectable_label(selected, item.name);
+                        ui.weak(&item.tags);
+                        name
+                    });
+                    if row.inner.on_hover_text(item.path).clicked() {
                         self.template = item.path.into();
                     }
                 }
-                });
-                left.add_space(16.0);
-                left.label(RichText::new(format!("{} weapon and armor references. Availability is checked when spawning; not every template has been tested.", self.templates.len())).small().weak());
-
-                let right = &mut columns[1];
-                right.heading("Item request");
-                right.label("Template path");
-                right.add(egui::TextEdit::multiline(&mut self.template).desired_rows(3).desired_width(f32::INFINITY));
-                right.horizontal(|ui| {
-                    ui.label("Quantity");
-                    number_input::number_input(ui, "quantity", &mut self.quantity, i32::MIN)
-                        .on_hover_text(format!("Enter a whole number between 1 and {MAX_QUANTITY}."));
-                });
-                right.add_space(8.0);
-                let weapon = self.is_weapon();
-                self.editor.show(right, weapon, (equipment_height - 145.0).max(80.0));
-                let valid = validate_grant(&self.template, self.request_quantity()).and_then(|()| self.editor.options(weapon).validate());
-                if let Err(error) = valid {
-                    right.colored_label(Color32::from_rgb(240, 150, 120), error);
-                }
-                right.add_space(10.0);
-                right.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                    if ui.add_enabled(self.can_spawn && !self.busy && valid.is_ok(), egui::Button::new("Spawn pickup").min_size(egui::vec2(ui.available_width(), 34.0))).clicked() { self.spawn_item(ui.ctx().clone()); }
-                });
-                if let Some(cancel) = &self.search_cancel
-                    && right.button("Cancel search").clicked() { cancel.store(true, Ordering::Release); }
-                right.label("Creates equipment near your hero with the selected settings. Pick it up normally to equip or store it.");
             });
-            ui.add_space(16.0);
-            ui.separator();
-            egui::CollapsingHeader::new("Game installation").default_open(false).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.install_path).desired_width(ui.available_width() - 86.0));
-                    if ui.add_enabled(!self.busy, egui::Button::new("Check")).clicked() { self.inspect_game(ui.ctx().clone()); }
-                });
-                ui.label(&self.game_status);
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!self.busy, egui::Button::new(if self.connection.is_some() { "Reconnect to game" } else { "Connect to game" })).clicked() { self.connect(ui.ctx().clone()); }
-                if self.connection.is_some() && ui.add_enabled(!self.busy, egui::Button::new("Disconnect game")).clicked() {
-                    self.connection = None;
-                    self.can_spawn = false;
-                    self.adapter_status = "Game disconnected. Adapter stays idle until the game exits.".into();
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!self.busy, egui::Button::new("Run isolated adapter test")).clicked() {
-                    self.test_adapter(ui.ctx().clone());
-                }
-                if self.diagnostic.is_some() && ui.button("Stop test host").clicked() {
-                    self.diagnostic = None;
-                    self.adapter_status = "Isolated adapter test stopped. Game is not connected.".into();
-                }
-            });
-            ui.label(&self.adapter_status);
-            ui.add_space(6.0);
-            ui.label(RichText::new("Local single-player only. Picked-up items can be saved by the game. Restart the game before replacing an attached adapter DLL.").small().weak());
-            });
-        });
     }
+
+    fn details(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        match self.current() {
+            Some(item) => {
+                ui.heading(item.name);
+                ui.weak(format!("{} · {}", item.kind.label(), item.tags));
+            }
+            None => {
+                ui.heading("Custom template");
+                ui.weak("Not in the bundled catalog. Availability is checked when spawning.");
+            }
+        }
+        ui.label(RichText::new(&self.template).small().monospace().weak());
+        egui::CollapsingHeader::new("Edit template path").show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut self.template)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace),
+            );
+        });
+        ui.separator();
+        let weapon = self.is_weapon();
+        self.editor.show(ui, weapon);
+    }
+
+    fn spawn_bar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        let weapon = self.is_weapon();
+        let valid = validate_grant(&self.template, self.request_quantity())
+            .and_then(|()| self.editor.options(weapon).validate());
+        if let Err(error) = valid {
+            ui.colored_label(ERROR, error);
+        }
+        let blocked = if self.connection.is_none() {
+            "Connect to the game first."
+        } else if !self.can_spawn {
+            "The game is not ready for item requests."
+        } else if self.busy {
+            "Wait for the current request to finish."
+        } else {
+            "Correct the highlighted value first."
+        };
+        ui.horizontal(|ui| {
+            ui.label("Quantity");
+            number_input::number_input(ui, "quantity", &mut self.quantity, i32::MIN).on_hover_text(
+                format!("Enter a whole number between 1 and {MAX_QUANTITY}."),
+            );
+            if let Some(cancel) = &self.search_cancel
+                && ui.button("Cancel search").clicked()
+            {
+                cancel.store(true, Ordering::Release);
+            }
+            let spawn =
+                egui::Button::new("Spawn pickup").min_size(egui::vec2(ui.available_width(), 30.0));
+            let enabled = self.can_spawn && !self.busy && valid.is_ok();
+            if ui
+                .add_enabled(enabled, spawn)
+                .on_hover_text("Creates equipment near your hero. Pick it up normally.")
+                .on_disabled_hover_text(blocked)
+                .clicked()
+            {
+                self.spawn_item(ui.ctx().clone());
+            }
+        });
+        ui.add_space(6.0);
+    }
+}
+
+/// Toggle chips for one filter row; selecting several matches any of them.
+fn chips(
+    ui: &mut egui::Ui,
+    title: &str,
+    options: &[&'static str],
+    selected: &mut BTreeSet<&'static str>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.weak(title);
+        for &option in options {
+            let on = selected.contains(option);
+            if ui.selectable_label(on, option).clicked() {
+                if on {
+                    selected.remove(option);
+                } else {
+                    selected.insert(option);
+                }
+            }
+        }
+    });
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
