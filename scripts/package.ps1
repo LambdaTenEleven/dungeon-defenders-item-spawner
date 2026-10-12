@@ -24,6 +24,15 @@ try {
     New-Item -ItemType Directory -Path $docsDirectory | Out-Null
     Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\integration.md') -Destination $docsDirectory
     Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\runtime-verification.md') -Destination $docsDirectory
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\current-build-validation.md') -Destination $docsDirectory
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\item-menu-implementation.md') -Destination $docsDirectory
+    $protocolDocs = Join-Path $packageDirectory 'crates\protocol'
+    New-Item -ItemType Directory -Path $protocolDocs -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'crates\protocol\README.md') -Destination $protocolDocs
+    $catalogDocs = Join-Path $packageDirectory 'crates\catalog'
+    New-Item -ItemType Directory -Path $catalogDocs -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'crates\catalog\README.md') -Destination $catalogDocs
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\automatic-catalog.md') -Destination $docsDirectory
 
     $testLog = Join-Path $OutputDirectory 'adapter-smoke.stdout.log'
     $errorLog = Join-Path $OutputDirectory 'adapter-smoke.stderr.log'

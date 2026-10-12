@@ -1,7 +1,8 @@
 //! A thread-specific message hook. Only this callback may enter the engine.
 
 use dd_protocol::{
-    Command, ErrorCode, Rejection, Request, Response, VERSION, pipe::Pipe, read_frame, write_frame,
+    Command, ErrorCode, Rejection, Request, Response, SpawnKind, SpawnOptions, SpawnOutcome,
+    VERSION, pipe::Pipe, read_frame, write_frame,
 };
 use std::{
     io::{self, Read},
@@ -35,6 +36,7 @@ const QUEUED: u8 = 0;
 const RUNNING: u8 = 1;
 const CANCELLED: u8 = 2;
 const SCHEDULE_TIMEOUT: Duration = Duration::from_millis(750);
+const RESPONSE_RESERVE: Duration = Duration::from_millis(250);
 
 static SESSION: Mutex<Option<Arc<Session>>> = Mutex::new(None);
 static MESSAGE: OnceLock<u32> = OnceLock::new();
@@ -72,12 +74,15 @@ struct Job {
     deadline: Instant,
     state: Arc<AtomicU8>,
     response: SyncSender<Response>,
+    catalog: Option<Arc<dd_catalog::CatalogSnapshot>>,
 }
 
 impl Job {
     fn begin(&self) -> bool {
         if Instant::now() >= self.deadline {
-            self.state.store(CANCELLED, Ordering::Release);
+            let _ =
+                self.state
+                    .compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire);
             return false;
         }
         self.state
@@ -93,8 +98,48 @@ fn reject(id: u64, message: &str) -> Response {
         result: Err(Rejection {
             code: ErrorCode::IntegrationUnavailable,
             message: message.into(),
+            spawn: None,
         }),
     }
+}
+
+/// Checks helper ownership without waiting on a reentrant message-hook lock.
+pub(crate) fn attachment_active() -> bool {
+    SESSION
+        .try_lock()
+        .ok()
+        .and_then(|session| session.clone())
+        .is_some_and(|session| session.alive())
+}
+
+fn uncertain_spawn(request: &Request) -> Option<SpawnOutcome> {
+    match &request.command {
+        Command::Spawn {
+            quantity, options, ..
+        } => Some(SpawnOutcome {
+            requested: *quantity,
+            spawned: 0,
+            kind: if matches!(options, SpawnOptions::WorldPickup {}) {
+                SpawnKind::WorldPickup
+            } else {
+                SpawnKind::EquipmentPickup
+            },
+            uncertain: true,
+        }),
+        _ => None,
+    }
+}
+
+fn reject_started(id: u64, message: &str, spawn: Option<SpawnOutcome>) -> Response {
+    let mut response = reject(id, message);
+    if let Err(rejection) = &mut response.result {
+        rejection.spawn = spawn;
+    }
+    response
+}
+
+fn completion_budget(deadline: Instant, now: Instant) -> Duration {
+    deadline.saturating_duration_since(now)
 }
 
 fn begin(owner_pid: u32) {
@@ -166,16 +211,18 @@ fn dispatch(
     sender: &SyncSender<Job>,
     request: Request,
     budget: Duration,
+    catalog: Option<Arc<dd_catalog::CatalogSnapshot>>,
 ) -> Response {
     let id = request.id;
-    let reserve = Duration::from_millis(250);
-    if budget <= reserve {
+    let attempted = uncertain_spawn(&request);
+    if budget <= RESPONSE_RESERVE {
         return reject(
             id,
             "Request arrived too close to its transport deadline; nothing was executed.",
         );
     }
-    let schedule_timeout = SCHEDULE_TIMEOUT.min(budget - reserve);
+    let execution_deadline = Instant::now() + (budget - RESPONSE_RESERVE);
+    let schedule_timeout = SCHEDULE_TIMEOUT.min(budget - RESPONSE_RESERVE);
     let state = Arc::new(AtomicU8::new(QUEUED));
     let (response, receiver) = mpsc::sync_channel(1);
     let job = Job {
@@ -183,6 +230,7 @@ fn dispatch(
         deadline: Instant::now() + schedule_timeout,
         state: Arc::clone(&state),
         response,
+        catalog,
     };
     if sender.try_send(job).is_err() {
         return reject(id, "The game thread is busy; request was not executed.");
@@ -208,18 +256,22 @@ fn dispatch(
     match receiver.recv_timeout(schedule_timeout) {
         Ok(response) => response,
         Err(_) => {
-            // The callback must claim QUEUED before entering the engine. A cancelled job cannot run later.
-            if state
-                .compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                reject(
+            match state.compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => reject(
                     id,
                     "Game thread did not accept the request before its deadline; nothing was executed.",
-                )
-            } else {
-                // An operation already executing cannot be cancelled safely. Never encourage a retry.
-                receiver.recv_timeout(Duration::from_millis(750)).unwrap_or_else(|_| reject(id, "The request started but completion was not confirmed. Check inventory before retrying."))
+                ),
+                Err(RUNNING) => {
+                    // A claimed native call cannot be interrupted safely. Package loading may pump
+                    // window messages; the queue remains claimed for the entire response budget.
+                    receiver.recv_timeout(completion_budget(execution_deadline, Instant::now())).unwrap_or_else(|_| {
+                    reject_started(id, "The request started but completion was not confirmed. Check nearby pickups and inventory before retrying.", attempted)
+                })
+                }
+                Err(_) => reject(
+                    id,
+                    "The queued request expired before execution; nothing was executed.",
+                ),
             }
         }
     }
@@ -227,10 +279,12 @@ fn dispatch(
 
 fn serve(session: &Session, sender: SyncSender<Job>) -> io::Result<()> {
     let mut pipe = Pipe::bind(std::process::id())?;
+    let mut catalogs = crate::catalog_runtime::CatalogState::default();
     while session.alive() {
         pipe.accept_until(|| !session.alive())?;
         let mut stop = false;
         if let Ok(request) = read_frame::<Request>(&mut pipe) {
+            pipe.prepare_response(&request);
             stop = request.version == VERSION && matches!(request.command, Command::Shutdown {});
             let response = if !session.alive() {
                 reject(
@@ -238,7 +292,22 @@ fn serve(session: &Session, sender: SyncSender<Job>) -> io::Result<()> {
                     "Adapter attachment ended; request was not executed.",
                 )
             } else {
-                dispatch(session, &sender, request, pipe.remaining_time())
+                match catalogs.prepare(&request) {
+                    Err(error) => reject(request.id, &error),
+                    Ok(prepared) => {
+                        let response = dispatch(
+                            session,
+                            &sender,
+                            request,
+                            pipe.remaining_time(),
+                            prepared.clone(),
+                        );
+                        if response.result.is_ok() {
+                            catalogs.commit(prepared);
+                        }
+                        response
+                    }
+                }
             };
             if write_frame(&mut pipe, &response).is_ok() {
                 let _ = pipe.read_exact(&mut [0]);
@@ -299,11 +368,13 @@ fn on_message(message: &mut MSG) {
         return;
     }
     let id = job.request.id;
+    let attempted = uncertain_spawn(&job.request);
     let response =
-        std::panic::catch_unwind(|| crate::engine::handle(job.request)).unwrap_or_else(|_| {
-            reject(
+        std::panic::catch_unwind(|| crate::engine::handle(job.request, job.catalog)).unwrap_or_else(|_| {
+            reject_started(
                 id,
-                "Adapter request panicked; completion was not confirmed.",
+                "Adapter request panicked; completion was not confirmed. Check nearby pickups and inventory before retrying.",
+                attempted,
             )
         });
     let _ = job.response.try_send(response);
@@ -339,6 +410,7 @@ mod tests {
             deadline,
             state: Arc::new(AtomicU8::new(QUEUED)),
             response: mpsc::sync_channel(1).0,
+            catalog: None,
         }
     }
 
@@ -370,5 +442,66 @@ mod tests {
                 .is_err()
         );
         assert!(!job.begin());
+    }
+
+    #[test]
+    fn expired_second_begin_cannot_relabel_running_work_as_cancelled() {
+        let mut job = job(Instant::now() + SCHEDULE_TIMEOUT);
+        assert!(job.begin());
+        job.deadline = Instant::now() - Duration::from_millis(1);
+        assert!(!job.begin());
+        assert_eq!(job.state.load(Ordering::Acquire), RUNNING);
+    }
+
+    #[test]
+    fn started_package_load_uses_remaining_response_budget_not_another_queue_timeout() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(30) - RESPONSE_RESERVE;
+        assert_eq!(
+            completion_budget(deadline, start + SCHEDULE_TIMEOUT),
+            Duration::from_secs(29)
+        );
+        assert_eq!(
+            completion_budget(deadline, start + Duration::from_secs(31)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn unconfirmed_spawn_preserves_requested_kind_and_uncertainty() {
+        for (options, kind) in [
+            (SpawnOptions::WorldPickup {}, SpawnKind::WorldPickup),
+            (
+                SpawnOptions::Collectible { stored_mana: None },
+                SpawnKind::EquipmentPickup,
+            ),
+        ] {
+            let request = Request::new(
+                4,
+                Command::Spawn {
+                    catalog: dd_catalog::CatalogKey {
+                        installation_id: "0".repeat(64),
+                        generation: "1".repeat(64),
+                    },
+                    template: "Package.Item".into(),
+                    quantity: 3,
+                    options,
+                },
+            );
+            let response = reject_started(4, "unconfirmed", uncertain_spawn(&request));
+            let outcome = response.result.unwrap_err().spawn.unwrap();
+            assert_eq!(outcome.requested, 3);
+            assert_eq!(outcome.spawned, 0);
+            assert_eq!(outcome.kind, kind);
+            assert!(outcome.uncertain);
+        }
+        assert!(uncertain_spawn(&Request::new(5, Command::Status {})).is_none());
+        assert!(
+            reject(6, "not executed")
+                .result
+                .unwrap_err()
+                .spawn
+                .is_none()
+        );
     }
 }

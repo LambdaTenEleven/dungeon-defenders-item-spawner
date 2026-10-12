@@ -1,7 +1,7 @@
 use crate::number_input::number_input;
 use dd_protocol::{
-    CustomItem, ItemOptions, Quality,
-    items::{DAMAGE_LIMIT, HERO_STATS, STAT_LIMIT, UPGRADE_LIMIT},
+    CustomItem, ItemCapabilities, ItemKind, ItemOptions, Quality, SpawnOptions,
+    items::{DAMAGE_LIMIT, HERO_STATS, MANA_TOKEN_LIMIT, STAT_LIMIT, UPGRADE_LIMIT},
 };
 use eframe::egui;
 
@@ -14,6 +14,8 @@ enum Mode {
 }
 
 pub struct ItemEditor {
+    profile: Option<(ItemKind, ItemCapabilities)>,
+    stored_mana: Option<i32>,
     mode: Mode,
     strength: f32,
     quality: Option<Quality>,
@@ -24,6 +26,8 @@ pub struct ItemEditor {
 impl Default for ItemEditor {
     fn default() -> Self {
         Self {
+            profile: None,
+            stored_mana: None,
             mode: Mode::Template,
             strength: 1.0,
             quality: None,
@@ -52,8 +56,26 @@ fn optional(ui: &mut egui::Ui, label: &str, value: &mut Option<i32>, min: i32, m
 }
 
 impl ItemEditor {
-    pub fn options(&self, weapon: bool) -> ItemOptions {
-        match self.mode {
+    /// A category or capability change starts clean; old fields cannot silently return later.
+    pub fn select(&mut self, kind: ItemKind, capabilities: ItemCapabilities) {
+        if self.profile.as_ref() != Some(&(kind, capabilities)) {
+            *self = Self {
+                profile: Some((kind, capabilities)),
+                ..Default::default()
+            };
+        }
+    }
+
+    pub fn options(&self, kind: ItemKind, caps: ItemCapabilities) -> SpawnOptions {
+        if kind == ItemKind::Collectible {
+            return SpawnOptions::Collectible {
+                stored_mana: caps.stored_mana.then_some(self.stored_mana).flatten(),
+            };
+        }
+        if kind == ItemKind::WorldPickup {
+            return SpawnOptions::WorldPickup {};
+        }
+        let options = match self.mode {
             Mode::Template => ItemOptions::TemplateDefaults,
             Mode::Random => ItemOptions::RandomRoll {
                 strength: self.strength,
@@ -62,23 +84,86 @@ impl ItemEditor {
             },
             Mode::Custom => {
                 let mut settings = self.custom.clone();
-                if weapon {
+                if !caps.resistances {
                     settings.resistances = [None; 4];
-                } else {
+                }
+                if !caps.weapon {
                     settings.weapon = Default::default();
+                }
+                let pet = &mut settings.pet;
+                match caps.pet {
+                    None => *pet = Default::default(),
+                    Some(c) => {
+                        if !c.damage {
+                            pet.damage = None;
+                        }
+                        if !c.healing {
+                            pet.healing = None;
+                        }
+                        if !c.mana {
+                            pet.mana = None;
+                        }
+                        if !c.boost {
+                            pet.boost = None;
+                        }
+                        if !c.attack_rate {
+                            pet.attack_rate = None;
+                        }
+                        if !c.range {
+                            pet.range = None;
+                        }
+                        if !c.projectiles {
+                            pet.projectiles = None;
+                        }
+                        if !c.projectile_speed {
+                            pet.projectile_speed = None;
+                        }
+                    }
                 }
                 ItemOptions::Custom {
                     settings: Box::new(settings),
                 }
             }
-        }
+        };
+        SpawnOptions::Equipment { options }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, weapon: bool) {
+    pub fn show(&mut self, ui: &mut egui::Ui, kind: ItemKind, caps: ItemCapabilities) {
+        self.select(kind, caps);
+        if kind == ItemKind::Unknown {
+            ui.weak("This item type has no verified spawn options.");
+            return;
+        }
+        if kind == ItemKind::Collectible {
+            ui.label("Create the collectible's packaged pickup. Collect and redeem it normally in the game.");
+            if caps.stored_mana {
+                egui::Grid::new("stored-mana")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        optional(
+                            ui,
+                            "Stored mana",
+                            &mut self.stored_mana,
+                            1,
+                            MANA_TOKEN_LIMIT,
+                        );
+                    });
+            }
+            return;
+        }
+        if kind == ItemKind::WorldPickup {
+            ui.label("Create the selected physical pickup near your hero.");
+            ui.small("Mission pickups keep their packaged behavior. Outside their mission, spawning does not grant mission progress; unsupported contexts are unavailable.");
+            return;
+        }
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.mode, Mode::Template, "Template defaults");
-            ui.selectable_value(&mut self.mode, Mode::Random, "Random roll");
-            ui.selectable_value(&mut self.mode, Mode::Custom, "Custom");
+            ui.add_enabled_ui(caps.random_roll, |ui| {
+                ui.selectable_value(&mut self.mode, Mode::Random, "Random roll");
+            });
+            ui.add_enabled_ui(caps.custom_common, |ui| {
+                ui.selectable_value(&mut self.mode, Mode::Custom, "Custom");
+            });
         });
         ui.add_space(4.0);
         match self.mode {
@@ -182,12 +267,10 @@ impl ItemEditor {
                             }
                         });
                     });
-                egui::CollapsingHeader::new(if weapon { "Weapon bonuses" } else { "Armor resistances" }).default_open(true).show(ui, |ui| {
-                    if weapon {
+                if caps.weapon {
+                    egui::CollapsingHeader::new("Weapon bonuses").default_open(true).show(ui, |ui| {
                         ui.small("Bonuses are added to the weapon's base values. Displayed totals and supported effects vary by weapon.");
-                    }
-                    egui::Grid::new("equipment-stats").num_columns(2).show(ui, |ui| {
-                        if weapon {
+                        egui::Grid::new("weapon-stats").num_columns(2).show(ui, |ui| {
                             let w = &mut self.custom.weapon;
                             optional(ui, "Damage bonus", &mut w.damage, 0, DAMAGE_LIMIT);
                             optional(ui, "Elemental damage bonus", &mut w.elemental_damage, 0, DAMAGE_LIMIT);
@@ -199,13 +282,42 @@ impl ItemEditor {
                             optional(ui, "Knockback bonus", &mut w.knockback, -127, 128);
                             optional(ui, "Charge speed bonus", &mut w.charge_speed, -127, 128);
                             optional(ui, "Blocking bonus", &mut w.blocking, -127, 128);
-                        } else {
-                            for (label, value) in ["Physical %", "Fire %", "Lightning %", "Poison %"].iter().zip(&mut self.custom.resistances) {
-                                optional(ui, label, value, 0, 100);
-                            }
-                        }
+                        });
                     });
-                });
+                }
+                if let Some(caps) = caps.pet {
+                    egui::CollapsingHeader::new("Pet abilities").default_open(true).show(ui, |ui| {
+                        ui.small("These fields use this pet family's verified stat meanings. Unchecked values stay at their defaults.");
+                        egui::Grid::new("pet-stats").num_columns(2).show(ui, |ui| {
+                            let p = &mut self.custom.pet;
+                            if caps.damage { optional(ui, "Damage bonus", &mut p.damage, 0, DAMAGE_LIMIT); }
+                            if caps.healing { optional(ui, "Healing bonus", &mut p.healing, 0, DAMAGE_LIMIT); }
+                            if caps.mana { optional(ui, "Mana generation bonus", &mut p.mana, 0, DAMAGE_LIMIT); }
+                            if caps.boost { optional(ui, "Boost bonus", &mut p.boost, 0, 128); }
+                            if caps.attack_rate { optional(ui, "Attack rate bonus", &mut p.attack_rate, -127, 128); }
+                            if caps.range { optional(ui, "Range bonus", &mut p.range, 0, DAMAGE_LIMIT); }
+                            if caps.projectiles { optional(ui, "Projectile count bonus", &mut p.projectiles, -127, 128); }
+                            if caps.projectile_speed { optional(ui, "Projectile speed bonus", &mut p.projectile_speed, -DAMAGE_LIMIT, DAMAGE_LIMIT); }
+                        });
+                    });
+                }
+                if caps.resistances {
+                    egui::CollapsingHeader::new("Resistances")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            egui::Grid::new("resistance-stats")
+                                .num_columns(2)
+                                .show(ui, |ui| {
+                                    for (label, value) in
+                                        ["Physical %", "Fire %", "Lightning %", "Poison %"]
+                                            .iter()
+                                            .zip(&mut self.custom.resistances)
+                                    {
+                                        optional(ui, label, value, 0, 100);
+                                    }
+                                });
+                        });
+                }
             }
         }
     }
@@ -215,27 +327,100 @@ impl ItemEditor {
 mod tests {
     use super::*;
 
+    fn entry(kind: ItemKind) -> dd_catalog::CatalogEntry {
+        crate::catalog::test_entry(kind)
+    }
+
     #[test]
-    fn switching_equipment_types_omits_inapplicable_overrides() {
+    fn changing_category_discards_old_fields_and_mode() {
+        let mut editor = ItemEditor::default();
+        let weapon = entry(ItemKind::Weapon);
+        let collectible = entry(ItemKind::Collectible);
+        editor.select(weapon.kind, weapon.capabilities);
+        editor.mode = Mode::Custom;
+        editor.custom.hero_stats[0] = Some(250);
+        editor.custom.weapon.damage = Some(12345);
+        editor.select(collectible.kind, collectible.capabilities);
+        assert!(matches!(
+            editor.options(collectible.kind, collectible.capabilities),
+            SpawnOptions::Collectible { stored_mana: None }
+        ));
+        editor.select(weapon.kind, weapon.capabilities);
+        assert_eq!(editor.custom, CustomItem::default());
+        assert_eq!(
+            editor.options(weapon.kind, weapon.capabilities),
+            SpawnOptions::Equipment {
+                options: ItemOptions::TemplateDefaults
+            }
+        );
+    }
+
+    #[test]
+    fn equipment_options_omit_unavailable_overrides() {
         let mut editor = ItemEditor {
             mode: Mode::Custom,
             ..Default::default()
         };
         editor.custom.hero_stats[0] = Some(250);
-        editor.custom.resistances[0] = Some(42);
         editor.custom.weapon.damage = Some(12345);
-        let ItemOptions::Custom { settings: weapon } = editor.options(true) else {
+        editor.custom.resistances[0] = Some(42);
+        editor.custom.pet.damage = Some(99);
+        let armor = entry(ItemKind::Armor);
+        let SpawnOptions::Equipment {
+            options: ItemOptions::Custom { settings },
+        } = editor.options(armor.kind, armor.capabilities)
+        else {
             panic!()
         };
-        assert_eq!(weapon.resistances, [None; 4]);
-        assert_eq!(weapon.weapon.damage, Some(12345));
-        let ItemOptions::Custom { settings: armor } = editor.options(false) else {
+        assert_eq!(settings.weapon, Default::default());
+        assert_eq!(settings.pet, Default::default());
+        assert_eq!(settings.hero_stats[0], Some(250));
+        let weapon = entry(ItemKind::Weapon);
+        let SpawnOptions::Equipment {
+            options: ItemOptions::Custom { settings },
+        } = editor.options(weapon.kind, weapon.capabilities)
+        else {
             panic!()
         };
-        assert_eq!(armor.weapon, Default::default());
-        assert_eq!(armor.resistances[0], Some(42));
-        assert_eq!(armor.hero_stats[0], Some(250));
-        editor.mode = Mode::Template;
-        assert_eq!(editor.options(false), ItemOptions::TemplateDefaults);
+        assert_eq!(settings.resistances, [None; 4]);
+        assert_eq!(settings.weapon.damage, Some(12345));
+    }
+
+    #[test]
+    fn changing_pet_family_clears_ability_overrides() {
+        let mut healer = entry(ItemKind::Pet);
+        healer.capabilities.pet = Some(dd_protocol::PetCapabilities {
+            healing: true,
+            ..Default::default()
+        });
+        let mut guardian = entry(ItemKind::Pet);
+        guardian.capabilities.pet = Some(dd_protocol::PetCapabilities {
+            boost: true,
+            ..Default::default()
+        });
+        let mut editor = ItemEditor::default();
+        editor.select(healer.kind, healer.capabilities);
+        editor.mode = Mode::Custom;
+        editor.custom.pet.healing = Some(1000);
+        editor.select(guardian.kind, guardian.capabilities);
+        assert_eq!(editor.custom.pet, Default::default());
+        assert!(matches!(
+            editor.options(guardian.kind, guardian.capabilities),
+            SpawnOptions::Equipment {
+                options: ItemOptions::TemplateDefaults
+            }
+        ));
+    }
+
+    #[test]
+    fn world_pickup_options_never_include_equipment_or_stored_mana() {
+        let mut editor = ItemEditor::default();
+        editor.custom.weapon.damage = Some(12345);
+        editor.stored_mana = Some(1000);
+        let world = entry(ItemKind::WorldPickup);
+        assert_eq!(
+            editor.options(world.kind, world.capabilities),
+            SpawnOptions::WorldPickup {}
+        );
     }
 }

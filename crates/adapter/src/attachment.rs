@@ -33,7 +33,7 @@ use windows_sys::Win32::{
     },
 };
 
-const GAME_HASH: &str = "4e4b03765c9e74415e27e36d952ebecd86a655ca27d8a46b5285279773e6d0f4";
+const GAME_HASH: &str = "2b43fef8ecf629d72b9a3fc032a65d6bf0298fd983301e97cdbfb45fd6314883";
 
 struct Target {
     process: OwnedHandle,

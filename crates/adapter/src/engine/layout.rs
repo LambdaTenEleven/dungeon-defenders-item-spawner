@@ -1,4 +1,4 @@
-//! Verified reflection layouts for Steam build 25809881; every entry is checked on attachment.
+//! Script package reflection contract; every entry is checked against the current build on attachment.
 use super::equipment::Property;
 pub(super) const PROPERTIES: &[Property] = &[
     Property {

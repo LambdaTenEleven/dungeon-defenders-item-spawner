@@ -57,7 +57,7 @@ pub(super) fn prepare(engine: &Engine, template: u32, item: u32) -> Result<()> {
         let value = read(template + source.offset, 4)?;
         let chance = f32::from_le_bytes(value.as_slice().try_into().expect("float"));
         require(
-            chance.is_finite() && (0.0..=1.0).contains(&chance),
+            valid_promotion_chance(chance),
             "Invalid template promotion chance.",
         )?;
         write(item + source.offset, &value)?;
@@ -118,6 +118,12 @@ pub(super) fn prepare(engine: &Engine, template: u32, item: u32) -> Result<()> {
     Ok(())
 }
 
+fn valid_promotion_chance(chance: f32) -> bool {
+    // The shipped fruit-spawning familiar authors -1. DetermineUltQuality compares
+    // FRand() directly with this threshold, so preserve the intentional sentinel.
+    chance.is_finite() && (-1.0..=1.0).contains(&chance)
+}
+
 fn disjoint(a: u32, a_len: u32, b: u32, b_len: u32) -> bool {
     a >= 0x10000
         && b >= 0x10000
@@ -144,6 +150,16 @@ fn fixed_ranges(ranges: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn authored_promotion_sentinel_is_preserved_and_invalid_floats_rejected() {
+        for chance in [-1.0, 0.0, 0.5, 1.0] {
+            assert!(valid_promotion_chance(chance));
+        }
+        for chance in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -2.0, 2.0] {
+            assert!(!valid_promotion_chance(chance));
+        }
+    }
+
     #[test]
     fn every_difficulty_uses_the_templates_last_upgrade_range() {
         let values: Vec<u8> = [1i32, 10, 20, 50, 100, 250]

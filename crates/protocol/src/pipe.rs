@@ -20,9 +20,12 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{MAX_FRAME_SIZE, Request, Response, VERSION, read_frame, write_frame};
+use crate::{
+    Command, MAX_FRAME_SIZE, Request, Response, VERSION, read_frame, validate_grant, write_frame,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(2);
+const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(10);
 
 fn pipe_name(pid: u32) -> Vec<u16> {
@@ -32,7 +35,32 @@ fn pipe_name(pid: u32) -> Vec<u16> {
         .collect()
 }
 
-/// A pipe with a deadline for the complete request/response, not per byte.
+fn response_budget(request: &Request) -> Duration {
+    if request.version != VERSION {
+        return TIMEOUT;
+    }
+    let valid = match &request.command {
+        Command::BindCatalog { catalog } => catalog.validate().is_ok(),
+        Command::InspectItem { catalog, template } => {
+            catalog.validate().is_ok() && validate_grant(template, 1).is_ok()
+        }
+        Command::Spawn {
+            catalog,
+            template,
+            quantity,
+            options,
+        } => {
+            catalog.validate().is_ok()
+                && validate_grant(template, *quantity).is_ok()
+                && options.validate().is_ok()
+        }
+        _ => false,
+    };
+    if valid { SPAWN_TIMEOUT } else { TIMEOUT }
+}
+
+/// A bounded pipe: two seconds to receive a frame, with a longer response phase
+/// only after a complete, validated spawn request. Deadlines never reset per byte.
 pub struct Pipe {
     file: File,
     deadline: Instant,
@@ -49,7 +77,7 @@ impl Pipe {
         if Instant::now() >= self.deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "Adapter did not respond within two seconds.",
+                "Adapter request exceeded its transport deadline.",
             ));
         }
         Ok(())
@@ -118,7 +146,15 @@ impl Pipe {
         }
     }
 
-    /// Budget left for the current complete transaction, including frame reception.
+    /// Extend only a fully decoded and validated spawn's execution/response phase.
+    /// Call after sending the complete frame on clients and decoding it on servers.
+    pub fn prepare_response(&mut self, request: &Request) {
+        if response_budget(request) == SPAWN_TIMEOUT {
+            self.deadline = Instant::now() + SPAWN_TIMEOUT;
+        }
+    }
+
+    /// Budget left for the current transport phase.
     pub fn remaining_time(&self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now())
     }
@@ -221,6 +257,7 @@ pub fn request(pid: u32, request: &Request) -> io::Result<Response> {
         deadline: Instant::now() + TIMEOUT,
     };
     write_frame(&mut pipe, request)?;
+    pipe.prepare_response(request);
     let response: Response = read_frame(&mut pipe)?;
     if response.version != VERSION || response.id != request.id {
         return Err(io::Error::new(
@@ -231,4 +268,61 @@ pub fn request(pid: u32, request: &Request) -> io::Result<Response> {
     // Let the server know that it can disconnect without discarding unread response bytes.
     pipe.write_all(&[1])?;
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ItemOptions, SpawnOptions};
+    fn spawn() -> Request {
+        Request::new(
+            1,
+            Command::Spawn {
+                catalog: crate::test_catalog_key(),
+                template: "Package.Item".into(),
+                quantity: 1,
+                options: SpawnOptions::Equipment {
+                    options: ItemOptions::TemplateDefaults,
+                },
+            },
+        )
+    }
+    #[test]
+    fn only_complete_valid_current_requests_receive_preparation_budget() {
+        assert_eq!(response_budget(&spawn()), SPAWN_TIMEOUT);
+        let mut old = spawn();
+        old.version = VERSION - 1;
+        assert_eq!(response_budget(&old), TIMEOUT);
+        assert_eq!(
+            response_budget(&Request::new(1, Command::Status {})),
+            TIMEOUT
+        );
+        assert_eq!(
+            response_budget(&Request::new(
+                1,
+                Command::BindCatalog {
+                    catalog: crate::test_catalog_key()
+                }
+            )),
+            SPAWN_TIMEOUT
+        );
+    }
+    #[test]
+    fn invalid_requests_do_not_extend_deadline() {
+        let mut request = spawn();
+        if let Command::Spawn { quantity, .. } = &mut request.command {
+            *quantity = 0;
+        }
+        assert_eq!(response_budget(&request), TIMEOUT);
+        let mut request = spawn();
+        if let Command::Spawn { catalog, .. } = &mut request.command {
+            catalog.generation = "../other".into();
+        }
+        assert_eq!(response_budget(&request), TIMEOUT);
+        let mut request = spawn();
+        if let Command::Spawn { template, .. } = &mut request.command {
+            *template = "../other".into();
+        }
+        assert_eq!(response_budget(&request), TIMEOUT);
+    }
 }

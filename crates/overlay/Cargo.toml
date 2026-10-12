@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+dd-catalog.workspace = true
 dd-protocol.workspace = true
 eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow"] }
 sha2.workspace = true

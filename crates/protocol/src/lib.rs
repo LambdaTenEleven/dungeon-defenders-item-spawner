@@ -4,16 +4,19 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 pub mod items;
-pub use items::{CustomItem, ItemOptions, LootConditions, Quality, WeaponStats};
+pub use items::{CustomItem, ItemOptions, LootConditions, PetStats, Quality, WeaponStats};
+pub mod catalog;
+pub use catalog::{
+    CatalogEntry, CatalogKey, CatalogSnapshot, ItemCapabilities, ItemKind, PetCapabilities,
+    validate_item_options,
+};
 
 #[cfg(windows)]
 pub mod pipe;
 
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 6;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024;
 pub const MAX_QUANTITY: u8 = 10;
-/// Packaged equipment references from the analyzed Startup_INT.upk; no game assets are embedded.
-pub const EQUIPMENT_CATALOG: &str = include_str!("catalog.txt");
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,12 +40,47 @@ impl Request {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     Status {},
-    Give {
+    BindCatalog {
+        catalog: CatalogKey,
+    },
+    InspectItem {
+        catalog: CatalogKey,
+        template: String,
+    },
+    Spawn {
+        catalog: CatalogKey,
         template: String,
         quantity: u8,
-        options: ItemOptions,
+        options: SpawnOptions,
     },
     Shutdown {},
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SpawnOptions {
+    Equipment { options: ItemOptions },
+    Collectible { stored_mana: Option<i32> },
+    WorldPickup {},
+}
+
+impl SpawnOptions {
+    pub fn needs_search(&self) -> bool {
+        matches!(self, Self::Equipment { options } if options.needs_search())
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Equipment { options } => options.validate(),
+            Self::Collectible { stored_mana }
+                if stored_mana
+                    .is_some_and(|mana| !(1..=items::MANA_TOKEN_LIMIT).contains(&mana)) =>
+            {
+                Err("Stored mana must be between 1 and 2000000000.")
+            }
+            Self::Collectible { .. } | Self::WorldPickup {} => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,9 +98,42 @@ pub struct AdapterStatus {
     pub bits: u32,
     pub diagnostic: bool,
     pub can_give: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<CatalogKey>,
     /// Set for a paced single-candidate roll; false confirms nothing was spawned.
     pub roll_matched: Option<bool>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspection: Option<ItemInspection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn: Option<SpawnOutcome>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ItemInspection {
+    pub template: String,
+    pub available: bool,
+    pub reason: Option<String>,
+    pub capabilities: ItemCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnOutcome {
+    pub requested: u8,
+    pub spawned: u8,
+    pub kind: SpawnKind,
+    /// The last dispatched action could not be confirmed; callers must not retry.
+    #[serde(default)]
+    pub uncertain: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnKind {
+    EquipmentPickup,
+    WorldPickup,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -70,6 +141,8 @@ pub struct AdapterStatus {
 pub struct Rejection {
     pub code: ErrorCode,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn: Option<SpawnOutcome>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +197,14 @@ pub fn read_frame<T: for<'a> Deserialize<'a>>(reader: &mut impl Read) -> io::Res
 }
 
 #[cfg(test)]
+fn test_catalog_key() -> CatalogKey {
+    CatalogKey {
+        installation_id: "0".repeat(64),
+        generation: "1".repeat(64),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
@@ -156,17 +237,23 @@ mod tests {
             &mut data,
             &Request::new(
                 42,
-                Command::Give {
+                Command::Spawn {
+                    catalog: test_catalog_key(),
                     template: "Package.Group.Item".into(),
                     quantity: 2,
-                    options: ItemOptions::default(),
+                    options: SpawnOptions::Equipment {
+                        options: ItemOptions::default(),
+                    },
                 },
             ),
         )
         .unwrap();
         let request: Request = read_frame(&mut Cursor::new(data)).unwrap();
         assert_eq!(request.id, 42);
-        assert!(matches!(request.command, Command::Give { quantity: 2, .. }));
+        assert!(matches!(
+            request.command,
+            Command::Spawn { quantity: 2, .. }
+        ));
     }
 
     #[test]
@@ -190,5 +277,70 @@ mod tests {
         assert!(
             serde_json::from_str::<Command>(r#"{"type":"status","execute":"anything"}"#).is_err()
         );
+    }
+
+    #[test]
+    fn version_six_rejects_legacy_and_cross_category_wire_shapes() {
+        assert_eq!(VERSION, 6);
+        assert!(serde_json::from_str::<Command>(r#"{"type":"give","template":"A.B","quantity":1,"options":{"mode":"template_defaults"}}"#).is_err());
+        assert!(
+            serde_json::from_str::<SpawnOptions>(
+                r#"{"kind":"collectible","stored_mana":1,"quality":"godly"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<SpawnOptions>(
+                r#"{"kind":"world_pickup","options":{"mode":"template_defaults"}}"#
+            )
+            .is_err()
+        );
+        for stored_mana in [Some(0), Some(-1), Some(items::MANA_TOKEN_LIMIT + 1)] {
+            assert!(
+                SpawnOptions::Collectible { stored_mana }
+                    .validate()
+                    .is_err()
+            );
+        }
+        let command = Command::InspectItem {
+            catalog: test_catalog_key(),
+            template: "A.B".into(),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &Request::new(17, command)).unwrap();
+        assert!(matches!(
+            read_frame::<Request>(&mut Cursor::new(bytes))
+                .unwrap()
+                .command,
+            Command::InspectItem { .. }
+        ));
+    }
+
+    #[test]
+    fn partial_failures_preserve_counts_and_uncertainty() {
+        let response = Response {
+            version: VERSION,
+            id: 8,
+            result: Err(Rejection {
+                code: ErrorCode::IntegrationUnavailable,
+                message: "Last dispatched pickup could not be confirmed.".into(),
+                spawn: Some(SpawnOutcome {
+                    requested: 4,
+                    spawned: 2,
+                    kind: SpawnKind::EquipmentPickup,
+                    uncertain: true,
+                }),
+            }),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+        let rejection = read_frame::<Response>(&mut Cursor::new(bytes))
+            .unwrap()
+            .result
+            .unwrap_err();
+        let outcome = rejection.spawn.unwrap();
+        assert_eq!(outcome.spawned, 2);
+        assert_eq!(outcome.requested, 4);
+        assert!(outcome.uncertain);
     }
 }

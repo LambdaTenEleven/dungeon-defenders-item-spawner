@@ -1,27 +1,36 @@
 //! Bindings for the exact analyzed x86 build. All engine work runs on its game thread.
 
 use dd_protocol::{
-    AdapterStatus, Command, ErrorCode, ItemOptions, Rejection, Request, Response, VERSION,
+    AdapterStatus, CatalogEntry, Command, ErrorCode, ItemInspection, ItemKind, ItemOptions,
+    Rejection, Request, Response, SpawnKind, SpawnOptions, SpawnOutcome, VERSION,
+    validate_item_options,
 };
 
 mod equipment;
 mod layout;
 mod tavern;
+mod world;
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use windows_sys::Win32::System::{
     Diagnostics::Debug::ReadProcessMemory,
     LibraryLoader::GetModuleHandleW,
     Threading::{GetCurrentProcess, GetCurrentThreadId},
 };
 
-const SHA256: &str = "4e4b03765c9e74415e27e36d952ebecd86a655ca27d8a46b5285279773e6d0f4";
-const NAMES: u32 = 0xd490e4;
-const OBJECTS: u32 = 0xd5b41c;
-const THREAD_ID: u32 = 0xce921c;
-const THREAD_INITIALIZED: u32 = 0xce9220;
-const ENGINE: u32 = 0xd68368;
-const PROCESS_EVENT: u32 = 0x85e90;
+// Recovered from build 25887270 itself; see docs/current-build-validation.md.
+pub(crate) const SHA256: &str = "2b43fef8ecf629d72b9a3fc032a65d6bf0298fd983301e97cdbfb45fd6314883";
+const NAMES: u32 = 0xd500e4;
+const OBJECTS: u32 = 0xd6241c;
+const THREAD_ID: u32 = 0xcf021c;
+const THREAD_INITIALIZED: u32 = 0xcf0220;
+const ENGINE: u32 = 0xd6f368;
+const PROCESS_EVENT: u32 = 0x863e0;
+#[cfg(target_arch = "x86")]
+const ACTOR_PROCESS_EVENT: u32 = 0x210030;
 const SPAWN: &str = "UDKGame.DunDefHeroManager.ServerCreateDroppedEquipment";
 static STATE: Mutex<Option<Result<Engine>>> = Mutex::new(None);
 
@@ -50,6 +59,9 @@ struct Engine {
     references: HashMap<String, Object>,
     fields: HashMap<String, Field>,
     function: u32,
+    world: Option<u32>,
+    load_failures: HashMap<String, String>,
+    catalog: Option<Arc<dd_catalog::CatalogSnapshot>>,
 }
 
 struct Session {
@@ -64,6 +76,16 @@ fn require(condition: bool, message: &str) -> Result<()> {
     } else {
         Err(message.into())
     }
+}
+
+fn reviewed_entry(entry: &CatalogEntry) -> Result<()> {
+    require(
+        entry.kind != ItemKind::Unknown
+            && dd_catalog::rules::reviewed_class(&entry.class_name)
+            && dd_catalog::rules::maximum_capabilities(entry.kind, &entry.class_name)
+                .template_defaults,
+        "This item's concrete class or category has no reviewed spawn lifecycle.",
+    )
 }
 
 fn read(address: u32, length: usize) -> Result<Vec<u8>> {
@@ -186,16 +208,36 @@ impl Engine {
             references: HashMap::new(),
             fields: HashMap::new(),
             function: 0,
+            world: None,
+            load_failures: HashMap::new(),
+            catalog: None,
         };
         engine.check_thread()?;
-        let entries = array(base + NAMES, 500_000)?;
+        engine.refresh_references()?;
+        engine.function = engine.reference(SPAWN)?;
+        engine.validate_function()?;
+        for (path, kind, size) in FIELDS {
+            engine
+                .fields
+                .insert((*path).into(), engine.reflect_field(path, kind, *size)?);
+        }
+        equipment::validate(&mut engine)?;
+        Ok(engine)
+    }
+
+    fn refresh_references(&mut self) -> Result<()> {
+        self.check_thread()?;
+        let entries = array(self.base + NAMES, 500_000)?;
         require(
             !entries.is_empty() && name(entries[0])? == "None",
             "Name table identity failed.",
         )?;
         let mut names = HashMap::new();
         let mut objects = HashMap::new();
-        for (index, address) in array(base + OBJECTS, 2_000_000)?.into_iter().enumerate() {
+        for (index, address) in array(self.base + OBJECTS, 2_000_000)?
+            .into_iter()
+            .enumerate()
+        {
             if address == 0 {
                 continue;
             }
@@ -228,7 +270,8 @@ impl Engine {
                 },
             );
         }
-        // Only engine metadata and equipment archetypes are retained; live player ownership is read afresh.
+        // Retain metadata, equipment, packages, and archetypes. Player ownership is read afresh.
+        let mut references = HashMap::new();
         let equipment_class = objects
             .values()
             .find(|o| {
@@ -251,24 +294,53 @@ impl Engine {
             };
             if class.name == "Class"
                 || class.name == "ScriptStruct"
+                || class.name == "Enum"
                 || class.name.ends_with("Property")
                 || class.name == "Function"
+                || class.name == "Package"
                 || is_equipment
+                || u32_at(object.address + 8)? & 0x400 != 0
             {
-                engine
-                    .references
-                    .insert(object_path(object, &objects)?, object.clone());
+                references.insert(object_path(object, &objects)?, object.clone());
             }
         }
-        engine.function = engine.reference(SPAWN)?;
-        engine.validate_function()?;
-        for (path, kind, size) in FIELDS {
-            engine
-                .fields
-                .insert((*path).into(), engine.reflect_field(path, kind, *size)?);
+        self.references = references;
+        Ok(())
+    }
+
+    fn refresh_session(&mut self) -> Result<Session> {
+        let session = self.session()?;
+        if self.world.is_some_and(|world| world != session.world) {
+            self.load_failures.clear();
+            self.refresh_references()?;
+            self.validate_function()?;
+            equipment::validate(self)?;
         }
-        equipment::validate(&mut engine)?;
-        Ok(engine)
+        self.world = Some(session.world);
+        Ok(session)
+    }
+
+    /// Resolve an override on the actual class before falling back to its parents.
+    fn method(&self, object: u32, leaf: &str) -> Result<String> {
+        self.live_object(object)?;
+        let mut class = u32_at(object + 0x34)?;
+        for _ in 0..64 {
+            if class == 0 {
+                break;
+            }
+            let path = self
+                .references
+                .iter()
+                .find_map(|(path, object)| (object.address == class).then_some(path))
+                .ok_or("Class metadata is absent; reconnect after loading.")?;
+            let method = format!("{path}.{leaf}");
+            if self.references.contains_key(&method) {
+                self.reference(&method)?;
+                return Ok(method);
+            }
+            class = u32_at(class + 0x3c)?;
+        }
+        Err(format!("No supported {leaf} implementation on this item."))
     }
 
     fn check_thread(&self) -> Result<()> {
@@ -487,35 +559,117 @@ impl Engine {
         Ok(())
     }
 
-    fn spawn(
-        &self,
-        template_path: &str,
-        quantity: u8,
-        options: &ItemOptions,
-    ) -> Result<Option<String>> {
-        dd_protocol::validate_grant(template_path, quantity).map_err(str::to_string)?;
-        options.validate().map_err(str::to_string)?;
-        let filtered = options.needs_search();
+    fn catalog_flag(&self, object: u32, path: &str) -> Result<bool> {
+        let owner = path.rsplit_once('.').ok_or("Invalid catalog property.")?.0;
+        self.is_a(object, owner)?;
+        let field = self.reflect_field(path, "Core.BoolProperty", 4)?;
         require(
-            !filtered || quantity == 1,
-            "Filtered rolls require one candidate per request.",
+            field.count == 1 && field.mask.is_power_of_two(),
+            "Catalog property boolean contract changed.",
+        )?;
+        Ok(u32_at(object + field.offset)? & field.mask != 0)
+    }
+
+    fn validate_classification(&self, entry: &CatalogEntry, template: u32) -> Result<()> {
+        require(
+            dd_catalog::rules::reviewed_class(&entry.class_name),
+            "This item's concrete class has no reviewed spawn lifecycle.",
+        )?;
+        if entry.kind == ItemKind::WorldPickup {
+            require(
+                dd_catalog::rules::maximum_capabilities(entry.kind, &entry.class_name)
+                    .template_defaults
+                    && dd_catalog::rules::maximum_capabilities(entry.kind, &entry.class_name)
+                        == entry.capabilities,
+                "Cached world-pickup capabilities differ from the reviewed class rules.",
+            )?;
+            return Ok(());
+        }
+        let kind = self.value(template, "UDKGame.HeroEquipmentNative.EquipmentType")?;
+        let can_equip = self.catalog_flag(template, "UDKGame.HeroEquipment.bCanBeEquipped")?;
+        require(
+            !self.catalog_flag(template, "UDKGame.HeroEquipment.bIsConsumable")?,
+            "Consumable initialization and redemption are not supported by this integration.",
         )?;
         require(
-            dd_protocol::EQUIPMENT_CATALOG
-                .lines()
-                .any(|path| path == template_path),
-            "Choose a packaged equipment reference from the catalog.",
+            dd_catalog::rules::category_from_runtime(&entry.class_name, kind as u8, can_equip)
+                == entry.kind,
+            "Cached category differs from the actual item's class and equipment type.",
         )?;
+        let mut properties = std::collections::BTreeMap::new();
+        for path in [
+            "UDKGame.HeroEquipment.bCantSave",
+            "UDKGame.HeroEquipment.bCantPutInItemBox",
+            "UDKGame.HeroEquipment.bIsConsumable",
+            "UDKGame.HeroEquipmentNative.bForceUseParentTemplate",
+            "UDKGame.HeroEquipmentNative.bDisableTheRandomization",
+            "UDKGame.HeroEquipment.bUseHighDigitManaTokenValue",
+            "UDKGame.HeroEquipment.bPlayerShopForceToMinimumSellWorth",
+            "UDKGame.HeroEquipmentNative.UseWeaponCoreStats",
+        ] {
+            properties.insert(
+                path.rsplit('.').next().unwrap().to_owned(),
+                serde_json::Value::Bool(self.catalog_flag(template, path)?),
+            );
+        }
+        for (class, path) in [
+            (
+                "UDKGame.HeroEquipment_Familiar_WithProjectileAI",
+                "UDKGame.HeroEquipment_Familiar_WithProjectileAI.bUseFixedShootSpeed",
+            ),
+            (
+                "UDKGame.HeroEquipment_Familiar_Melee",
+                "UDKGame.HeroEquipment_Familiar_Melee.bAlsoShootProjectile",
+            ),
+        ] {
+            if self.is_a(template, class).is_ok() {
+                properties.insert(
+                    path.rsplit('.').next().unwrap().to_owned(),
+                    serde_json::Value::Bool(self.catalog_flag(template, path)?),
+                );
+            }
+        }
+        if entry.kind == ItemKind::Collectible {
+            require(
+                kind == 5
+                    && dd_catalog::rules::collectible_group(&entry.path, &properties).is_some(),
+                "This collectible family has no reviewed initialization rule.",
+            )?;
+        }
         require(
-            !template_path.starts_with("Transient.") && !template_path.contains("Default__"),
-            "Choose an equipment archetype, not a live inventory or class-default object.",
+            dd_catalog::rules::capabilities(entry.kind, &entry.class_name, &properties)
+                == entry.capabilities,
+            "Cached capabilities differ from the actual template properties; rebuild the catalog.",
+        )
+    }
+
+    fn validate_template(&self, entry: &CatalogEntry, template: u32) -> Result<()> {
+        require(
+            entry.unavailable_reason.is_none(),
+            entry
+                .unavailable_reason
+                .as_deref()
+                .unwrap_or("Excluded catalog entry."),
         )?;
-        let template = self.reference(template_path)?;
-        self.is_a(template, "UDKGame.HeroEquipment")?;
+        self.is_a(template, &entry.class_name)?;
+        require(
+            u32_at(template + 0x34)? == self.reference(&entry.class_name)?,
+            "Template class differs from the reviewed catalog.",
+        )?;
         require(
             u32_at(template + 8)? & 0x400 != 0,
-            "The selected object is not an equipment archetype.",
+            "Choose an archetype, not a live or class-default object.",
         )?;
+        require(
+            !entry.path.contains("Default__") && !entry.path.starts_with("Transient."),
+            "Class defaults and transient objects are unsupported.",
+        )?;
+        if entry.kind == ItemKind::WorldPickup {
+            self.validate_classification(entry, template)?;
+            return Ok(());
+        }
+        self.is_a(template, "UDKGame.HeroEquipment")?;
+        self.validate_classification(entry, template)?;
         require(
             self.value(template, "UDKGame.HeroEquipmentNative.EquipmentID1")? == 0
                 && self.value(template, "UDKGame.HeroEquipmentNative.EquipmentID2")? == 0,
@@ -533,107 +687,255 @@ impl Engine {
                 && !self.flag(template, "UDKGame.HeroEquipment.bCantPutInItemBox")?,
             "This equipment cannot be stored normally.",
         )?;
-        let equipment_type = self.value(template, "UDKGame.HeroEquipmentNative.EquipmentType")?;
-        require(equipment_type <= 4, "Only weapons and armor are supported.")?;
-        if equipment_type == 0 {
+        let kind = self.value(template, "UDKGame.HeroEquipmentNative.EquipmentType")?;
+        require(
+            entry.equipment_type.map(u32::from) == Some(kind),
+            "Equipment type differs from the reviewed catalog.",
+        )?;
+        if entry.kind == ItemKind::Weapon {
             require(
                 self.value(template, "UDKGame.HeroEquipment.EquipmentWeaponTemplate")? != 0,
                 "Weapon archetype has no weapon template.",
             )?;
         }
-        let mut confirmed = 0;
-        let mut ids = Vec::new();
-        for _ in 0..quantity {
-            let result: Result<bool> = (|| {
-                let session = self.session()?;
-                self.validate_function()?;
-                let drops = array(
-                    self.field_address(
-                        template,
-                        "UDKGame.HeroEquipment.DroppedEquipmentTemplates",
-                    )?,
-                    64,
-                )?;
-                let drop_templates = if drops.is_empty() {
-                    let field = self.fields["UDKGame.DunDefHeroManager.DroppedEquipmentTemplates"];
-                    require(
-                        equipment_type < field.count,
-                        "Dropped-equipment type is outside the manager array.",
-                    )?;
-                    vec![u32_at(session.manager + field.offset + equipment_type * 4)?]
-                } else {
-                    drops
-                };
-                for drop in drop_templates {
-                    self.is_a(drop, "UDKGame.DunDefDroppedEquipment")?;
+        let drops = array(
+            self.field_address(template, "UDKGame.HeroEquipment.DroppedEquipmentTemplates")?,
+            64,
+        )?;
+        require(
+            entry.kind != ItemKind::Collectible || !drops.is_empty(),
+            "Collectibles require their own verified dropped-equipment template.",
+        )?;
+        if drops.is_empty() {
+            let session = self.session()?;
+            let field = self.fields["UDKGame.DunDefHeroManager.DroppedEquipmentTemplates"];
+            require(
+                kind < field.count,
+                "Equipment type has no dropped-item fallback.",
+            )?;
+            self.is_a(
+                u32_at(session.manager + field.offset + kind * 4)?,
+                "UDKGame.DunDefDroppedEquipment",
+            )?;
+        } else {
+            for drop in drops {
+                self.is_a(drop, "UDKGame.DunDefDroppedEquipment")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_catalog(&self, key: &dd_catalog::CatalogKey) -> Result<()> {
+        key.validate().map_err(str::to_owned)?;
+        require(
+            self.catalog
+                .as_ref()
+                .is_some_and(|catalog| catalog.key == *key),
+            "Catalog generation changed; reconnect and inspect again.",
+        )
+    }
+
+    fn inspect(&self, path: &str) -> ItemInspection {
+        let entry = self.catalog.as_ref().and_then(|catalog| catalog.find(path));
+        let result = (|| -> Result<Option<String>> {
+            let session = self.session()?;
+            let entry = entry.ok_or("Choose an item from the current scanned catalog.")?;
+            if let Some(reason) = &entry.unavailable_reason {
+                return Err(reason.clone());
+            }
+            reviewed_entry(entry)?;
+            dd_protocol::validate_grant(path, 1).map_err(str::to_owned)?;
+            let template = if self.references.contains_key(path) {
+                Some(self.reference(path)?)
+            } else {
+                None
+            };
+            if let Some(template) = template {
+                self.validate_template(entry, template)?;
+            } else {
+                if let Some(reason) = self.load_failures.get(path) {
+                    return Err(reason.clone());
                 }
-                let mut params = [0u32; 17];
-                params[0] = if let ItemOptions::Custom { settings } = options {
-                    equipment::create(self, template, session.manager, equipment_type, settings)?
-                } else if let ItemOptions::RandomRoll {
-                    strength,
-                    quality,
-                    conditions,
-                } = options
-                    && filtered
-                {
+                world::validate_loader(self)?;
+            }
+            if entry.kind == ItemKind::WorldPickup {
+                world::inspect(self, &session, entry, template)?;
+            }
+            Ok(template.is_none().then(|| "Assets will be loaded when spawning; unavailable dependencies will reject the request.".into()))
+        })();
+        let (available, reason) = match result {
+            Ok(note) => (true, note),
+            Err(reason) => (false, Some(reason)),
+        };
+        ItemInspection {
+            template: path.into(),
+            available,
+            reason,
+            capabilities: entry.map(|item| item.capabilities).unwrap_or_default(),
+        }
+    }
+
+    fn spawn(
+        &mut self,
+        template_path: &str,
+        quantity: u8,
+        options: &SpawnOptions,
+        progress: &mut SpawnOutcome,
+    ) -> Result<()> {
+        dd_protocol::validate_grant(template_path, quantity).map_err(str::to_owned)?;
+        let catalog = Arc::clone(
+            self.catalog
+                .as_ref()
+                .ok_or("Bind a scanned catalog first.")?,
+        );
+        let entry = catalog
+            .find(template_path)
+            .ok_or("Choose an item from the current scanned catalog.")?;
+        if let Some(reason) = &entry.unavailable_reason {
+            return Err(reason.clone());
+        }
+        reviewed_entry(entry)?;
+        validate_item_options(entry, options).map_err(str::to_owned)?;
+        let session = self.refresh_session()?;
+        if entry.kind == ItemKind::WorldPickup {
+            // Reject missing mission controllers before activating a cooked package.
+            world::inspect(self, &session, entry, None)?;
+        }
+        let template = if self.references.contains_key(template_path) {
+            self.reference(template_path)?
+        } else {
+            if let Some(reason) = self.load_failures.get(template_path) {
+                return Err(reason.clone());
+            }
+            world::load_template(self, &session, entry).inspect_err(|reason| {
+                self.load_failures
+                    .insert(template_path.into(), reason.clone());
+            })?
+        };
+        self.validate_template(entry, template)?;
+        if matches!(
+            options,
+            SpawnOptions::Equipment {
+                options: ItemOptions::RandomRoll { .. }
+            }
+        ) {
+            require(
+                !self.flag(
+                    template,
+                    "UDKGame.HeroEquipmentNative.bDisableTheRandomization",
+                )?,
+                "This template disables natural randomization. Use Template defaults or Custom.",
+            )?;
+        }
+        let filtered = options.needs_search();
+        require(
+            !filtered || quantity == 1,
+            "Filtered rolls require one candidate per request.",
+        )?;
+        let mut ids = Vec::new();
+        for index in 0..quantity {
+            require(
+                crate::bridge::attachment_active(),
+                "The attachment owner disconnected; no further pickups were spawned.",
+            )?;
+            let session = self.session()?;
+            if entry.kind == ItemKind::WorldPickup {
+                world::inspect(self, &session, entry, Some(template))?;
+                world::spawn_one(
+                    self,
+                    &session,
+                    template,
+                    entry,
+                    index,
+                    &mut progress.uncertain,
+                )?;
+                progress.spawned += 1;
+                continue;
+            }
+            self.validate_function()?;
+            let mut params = [0u32; 17];
+            params[0] = match options {
+                SpawnOptions::Equipment {
+                    options: ItemOptions::Custom { settings },
+                } => equipment::create(self, template, session.manager, entry, settings)?,
+                SpawnOptions::Equipment {
+                    options:
+                        ItemOptions::RandomRoll {
+                            strength,
+                            quality,
+                            conditions,
+                        },
+                } if filtered => {
                     let Some(item) = equipment::roll(
                         self,
                         template,
                         session.manager,
-                        equipment_type,
+                        entry,
                         *strength,
                         *quality,
                         *conditions,
                     )?
                     else {
-                        return Ok(false);
+                        return Ok(());
                     };
                     item
-                } else {
-                    template
-                };
-                params[1] = session.pawn;
-                params[2] = match options {
-                    ItemOptions::RandomRoll { strength, .. } if !filtered => strength.to_bits(),
-                    _ => 0,
-                };
-                params[3] = u32::from(!filtered && !matches!(options, ItemOptions::Custom { .. }));
-                params[13] = (-2i32) as u32;
-                // Source archetypes have placeholder IDs (0,0); do not delete existing drops by those IDs.
-                // The game's InitFromNetInfo assigns fresh IDs to the newly constructed item.
-                params[15] = 1;
-                self.dispatch(session.manager, self.function, &mut params)?;
-                let dropped = params[16];
-                self.is_a(dropped, "UDKGame.DunDefDroppedEquipment")?;
-                self.actor_alive(dropped)?;
-                require(
-                    self.value(dropped, "Engine.Actor.WorldInfo")? == session.world,
-                    "Returned pickup is in a different world.",
-                )?;
-                let item =
-                    self.value(dropped, "UDKGame.DunDefDroppedEquipment.MyEquipmentObject")?;
-                self.is_a(item, "UDKGame.HeroEquipment")?;
-                require(
-                    u32_at(item + 0x38)? == template,
-                    "Returned equipment does not match the selected archetype.",
-                )?;
-                let id = (
-                    self.value(item, "UDKGame.HeroEquipmentNative.EquipmentID1")?,
-                    self.value(item, "UDKGame.HeroEquipmentNative.EquipmentID2")?,
-                );
-                require(
-                    id != (0, 0) && !ids.contains(&id),
-                    "Returned equipment does not have a fresh item ID.",
-                )?;
-                if let ItemOptions::Custom { settings } = options {
-                    equipment::verify(self, item, settings)?;
                 }
-                if let ItemOptions::RandomRoll {
-                    quality: Some(quality),
-                    ..
-                } = options
-                {
+                SpawnOptions::Collectible {
+                    stored_mana: Some(_),
+                } => {
+                    let SpawnOptions::Collectible { stored_mana } = options else {
+                        unreachable!()
+                    };
+                    equipment::create_collectible(self, template, session.manager, *stored_mana)?
+                }
+                _ => template,
+            };
+            params[1] = session.pawn;
+            params[2] = match options {
+                SpawnOptions::Equipment {
+                    options: ItemOptions::RandomRoll { strength, .. },
+                } if !filtered => strength.to_bits(),
+                _ => 0,
+            };
+            params[3] = u32::from(params[0] == template);
+            params[13] = (-2i32) as u32;
+            // Source archetypes have placeholder IDs; never delete existing drops based on (0,0).
+            params[15] = 1;
+            progress.uncertain = true;
+            self.dispatch(session.manager, self.function, &mut params)?;
+            let dropped = params[16];
+            self.is_a(dropped, "UDKGame.DunDefDroppedEquipment")?;
+            self.actor_alive(dropped)?;
+            require(
+                self.value(dropped, "Engine.Actor.WorldInfo")? == session.world,
+                "Returned pickup is in a different world.",
+            )?;
+            let item = self.value(dropped, "UDKGame.DunDefDroppedEquipment.MyEquipmentObject")?;
+            self.is_a(item, &entry.class_name)?;
+            require(
+                u32_at(item + 0x34)? == self.reference(&entry.class_name)?
+                    && u32_at(item + 0x38)? == template,
+                "Returned equipment does not preserve the selected class and archetype.",
+            )?;
+            let id = (
+                self.value(item, "UDKGame.HeroEquipmentNative.EquipmentID1")?,
+                self.value(item, "UDKGame.HeroEquipmentNative.EquipmentID2")?,
+            );
+            require(
+                id != (0, 0) && !ids.contains(&id),
+                "Returned equipment does not have a fresh item ID.",
+            )?;
+            match options {
+                SpawnOptions::Equipment {
+                    options: ItemOptions::Custom { settings },
+                } => equipment::verify(self, item, settings)?,
+                SpawnOptions::Equipment {
+                    options:
+                        ItemOptions::RandomRoll {
+                            quality: Some(quality),
+                            ..
+                        },
+                } => {
                     equipment::verify(
                         self,
                         item,
@@ -643,38 +945,36 @@ impl Engine {
                         },
                     )?;
                 }
-                ids.push(id);
-                Ok(true)
-            })();
-            if matches!(result, Ok(false)) {
-                return Ok(None);
+                SpawnOptions::Collectible { stored_mana } => {
+                    equipment::verify_collectible(self, item, *stored_mana)?
+                }
+                _ => (),
             }
-            if let Err(error) = result {
-                return Err(format!(
-                    "{confirmed} pickup(s) confirmed. {error} Check the game before retrying; a dispatched action may have completed."
-                ));
-            }
-            confirmed += 1;
+            ids.push(id);
+            progress.uncertain = false;
+            progress.spawned += 1;
         }
-        Ok(Some(format!(
-            "Spawned {confirmed} pickup(s) nearby. Pick them up in the game to equip or store them."
-        )))
+        Ok(())
     }
 
     #[cfg(target_arch = "x86")]
     fn dispatch(&self, object: u32, function: u32, params: &mut [u32]) -> Result<()> {
         self.check_thread()?;
         self.live_object(object)?;
+        let target = u32_at(u32_at(object)? + 0x104)?;
         require(
-            u32_at(u32_at(object)? + 0x104)? == self.base + PROCESS_EVENT,
+            target == self.base + PROCESS_EVENT || target == self.base + ACTOR_PROCESS_EVENT,
             "Object dispatcher does not match the verified build.",
         )?;
+        if target == self.base + ACTOR_PROCESS_EVENT {
+            self.is_a(object, "Engine.Actor")?;
+        }
         // SAFETY: exact image hash, thread, live object, vtable target, reflected function and every
         // parameter's offset/type/size were checked immediately before this call. This x86 ABI was
         // recovered from the shipped caller and callee (ECX=this, three stack args, ret 12).
         unsafe {
             let call: unsafe extern "thiscall" fn(u32, u32, *mut u32, *mut std::ffi::c_void) =
-                std::mem::transmute((self.base + PROCESS_EVENT) as usize);
+                std::mem::transmute(target as usize);
             call(object, function, params.as_mut_ptr(), std::ptr::null_mut());
         }
         Ok(())
@@ -687,7 +987,10 @@ impl Engine {
 }
 
 pub fn initialize() -> Result<()> {
-    let mut state = STATE.lock().map_err(|_| "Engine state lock failed.")?;
+    // Package loading can pump messages on this thread. Never wait on our own active callback.
+    let mut state = STATE
+        .try_lock()
+        .map_err(|_| "An engine operation is already in progress.")?;
     // Each new attachment refreshes the catalog after map/package changes.
     *state = Some(Engine::new());
     match state.as_ref().expect("initialized") {
@@ -696,61 +999,133 @@ pub fn initialize() -> Result<()> {
     }
 }
 
-pub fn handle(request: Request) -> Response {
-    let result: Result<AdapterStatus> =
-        (|| {
-            require(
-                request.version == VERSION,
-                "Overlay and adapter versions differ.",
-            )?;
-            let state = STATE.lock().map_err(|_| "Engine state lock failed.")?;
-            let engine = state
-                .as_ref()
-                .ok_or("Game adapter has not initialized.")?
-                .as_ref()
-                .map_err(Clone::clone)?;
-            let ready = engine.session();
-            let mut roll_matched = None;
-            let (can_give, message) = match request.command {
-            Command::Status {} => match ready {
-                Ok(_) => (
-                    true,
-                    "Connected to Dungeon Defenders local single-player. Ready to spawn pickups."
-                        .into(),
-                ),
-                Err(error) => (false, error),
-            },
-            Command::Give { template, quantity, options } => {
-                ready?;
-                let result = engine.spawn(&template, quantity, &options)?;
-                if options.needs_search() {
-                    roll_matched = Some(result.is_some());
-                }
-                (true, result.unwrap_or_else(|| "Roll did not match; nothing spawned.".into()))
-            }
-            Command::Shutdown {} => (false, "Game adapter disconnected.".into()),
+pub fn handle(
+    request: Request,
+    prepared_catalog: Option<Arc<dd_catalog::CatalogSnapshot>>,
+) -> Response {
+    let mut failed_spawn = None;
+    let result: Result<AdapterStatus> = (|| {
+        require(
+            request.version == VERSION,
+            "Overlay and adapter versions differ.",
+        )?;
+        let mut state = STATE.try_lock().map_err(
+            |_| "An engine operation is already in progress; no nested action was executed.",
+        )?;
+        let engine = state
+            .as_mut()
+            .ok_or("Game adapter has not initialized.")?
+            .as_mut()
+            .map_err(|error| error.clone())?;
+        let ready = engine.refresh_session();
+        let mut status = AdapterStatus {
+            pid: std::process::id(),
+            bits: usize::BITS,
+            diagnostic: false,
+            can_give: ready.is_ok() && engine.catalog.is_some(),
+            catalog: engine.catalog.as_ref().map(|catalog| catalog.key.clone()),
+            roll_matched: None,
+            inspection: None,
+            spawn: None,
+            message: String::new(),
         };
-            Ok(AdapterStatus {
-                pid: std::process::id(),
-                bits: usize::BITS,
-                diagnostic: false,
-                can_give,
-                roll_matched,
-                message,
-            })
-        })();
-    let result = result.map_err(|message| Rejection {
-        code: if request.version != VERSION {
-            ErrorCode::ProtocolMismatch
-        } else {
-            ErrorCode::IntegrationUnavailable
-        },
-        message,
-    });
+        match request.command {
+            Command::Status {} => {
+                status.message = match ready {
+                    Ok(_) => "Connected to Dungeon Defenders local single-player. Select an item to inspect its availability.".into(),
+                    Err(error) => error,
+                };
+            }
+            Command::BindCatalog { catalog } => {
+                ready?;
+                let prepared =
+                    prepared_catalog.ok_or("Catalog was not prepared by the adapter worker.")?;
+                require(
+                    prepared.key == catalog,
+                    "Prepared catalog identity differs.",
+                )?;
+                engine.catalog = Some(prepared);
+                engine.load_failures.clear();
+                status.catalog = Some(catalog);
+                status.can_give = true;
+                status.message = "Scanned catalog bound to this local game session.".into();
+            }
+            Command::InspectItem { catalog, template } => {
+                engine.check_catalog(&catalog)?;
+                let inspection = engine.inspect(&template);
+                status.message = inspection
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "Selected item is available.".into());
+                status.inspection = Some(inspection);
+            }
+            Command::Spawn {
+                catalog,
+                template,
+                quantity,
+                options,
+            } => {
+                ready?;
+                engine.check_catalog(&catalog)?;
+                let mut outcome = SpawnOutcome {
+                    requested: quantity,
+                    spawned: 0,
+                    uncertain: false,
+                    kind: if matches!(options, SpawnOptions::WorldPickup {}) {
+                        SpawnKind::WorldPickup
+                    } else {
+                        SpawnKind::EquipmentPickup
+                    },
+                };
+                if let Err(error) = engine.spawn(&template, quantity, &options, &mut outcome) {
+                    failed_spawn = Some(outcome);
+                    return Err(format!(
+                        "{} pickup(s) confirmed. {error}{}",
+                        outcome.spawned,
+                        if outcome.uncertain {
+                            " A dispatched action could not be confirmed; check the game before retrying."
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                if options.needs_search() {
+                    status.roll_matched = Some(outcome.spawned > 0);
+                }
+                status.message = if outcome.spawned == 0 {
+                    "Roll did not match; nothing spawned.".into()
+                } else if outcome.kind == SpawnKind::WorldPickup {
+                    format!(
+                        "Spawned {} world pickup(s) nearby. Mission effects depend on the active game mode.",
+                        outcome.spawned
+                    )
+                } else {
+                    format!(
+                        "Spawned {} pickup(s) nearby. Pick them up in the game to equip or store them.",
+                        outcome.spawned
+                    )
+                };
+                status.spawn = Some(outcome);
+            }
+            Command::Shutdown {} => {
+                status.can_give = false;
+                status.message = "Game adapter disconnected.".into();
+            }
+        }
+        Ok(status)
+    })();
     Response {
         version: VERSION,
         id: request.id,
-        result,
+        result: result.map_err(|message| Rejection {
+            code: if request.version != VERSION {
+                ErrorCode::ProtocolMismatch
+            } else {
+                ErrorCode::IntegrationUnavailable
+            },
+            message,
+            spawn: failed_spawn,
+        }),
     }
 }
 

@@ -1,5 +1,10 @@
 # Runtime verification
 
+This is historical evidence for build 25809881. Current development targets
+25887270; see [current-build validation](current-build-validation.md) and the
+[item-menu implementation report](item-menu-implementation.md). These older live
+results do not validate the new executable or additional item families.
+
 Verified on 2026-10-11 with Steam build 25809881, Win32 executable SHA-256
 `4e4b03765c9e74415e27e36d952ebecd86a655ca27d8a46b5285279773e6d0f4`.
 

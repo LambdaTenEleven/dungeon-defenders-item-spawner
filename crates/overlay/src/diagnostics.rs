@@ -69,6 +69,12 @@ impl Drop for DiagnosticHost {
 
 #[cfg(windows)]
 pub fn self_test() -> Result<(), String> {
+    fn key() -> dd_catalog::CatalogKey {
+        dd_catalog::CatalogKey {
+            installation_id: "a".repeat(64),
+            generation: "b".repeat(64),
+        }
+    }
     let (mut host, status) = DiagnosticHost::start()?;
     println!(
         "PASS: loaded real {}-bit Rust adapter DLL in diagnostic host {}",
@@ -76,10 +82,13 @@ pub fn self_test() -> Result<(), String> {
     );
     let invalid = host.send(Request::new(
         2,
-        Command::Give {
+        Command::Spawn {
+            catalog: key(),
             template: "Bad;Command".into(),
             quantity: 1,
-            options: dd_protocol::ItemOptions::default(),
+            options: dd_protocol::SpawnOptions::Equipment {
+                options: dd_protocol::ItemOptions::default(),
+            },
         },
     ))?;
     if !matches!(invalid.result, Err(ref e) if e.code == ErrorCode::InvalidRequest) {
@@ -100,10 +109,11 @@ pub fn self_test() -> Result<(), String> {
     ] {
         let response = host.send(Request::new(
             6,
-            Command::Give {
+            Command::Spawn {
+                catalog: key(),
                 template: "Package.Item".into(),
                 quantity: 1,
-                options,
+                options: dd_protocol::SpawnOptions::Equipment { options },
             },
         ))?;
         if !matches!(response.result, Err(ref e) if e.code == ErrorCode::InvalidRequest) {
@@ -113,16 +123,41 @@ pub fn self_test() -> Result<(), String> {
     println!("PASS: invalid random/custom settings rejected by the real adapter DLL");
     let grant = host.send(Request::new(
         3,
-        Command::Give {
+        Command::Spawn {
+            catalog: key(),
             template: "Package.Item".into(),
             quantity: 1,
-            options: dd_protocol::ItemOptions::default(),
+            options: dd_protocol::SpawnOptions::Equipment {
+                options: dd_protocol::ItemOptions::default(),
+            },
         },
     ))?;
     if !matches!(grant.result, Err(ref e) if e.code == ErrorCode::IntegrationUnavailable) {
         return Err("Unverified item grant did not fail closed.".into());
     }
     println!("PASS: valid item request rejected in the isolated diagnostic host");
+    let inspection = host.send(Request::new(
+        7,
+        Command::InspectItem {
+            catalog: key(),
+            template: "Package.Item".into(),
+        },
+    ))?;
+    match inspection.result {
+        Ok(status)
+            if status
+                .inspection
+                .as_ref()
+                .is_some_and(|item| !item.available) => {}
+        Err(ref error) if error.code == ErrorCode::IntegrationUnavailable => {}
+        _ => return Err("Diagnostic host authorized an unverified item inspection.".into()),
+    }
+    println!("PASS: selected item inspection cannot authorize spawning in the diagnostic host");
+    let bound = host.send(Request::new(8, Command::BindCatalog { catalog: key() }))?;
+    if !matches!(bound.result, Err(ref error) if error.code == ErrorCode::IntegrationUnavailable) {
+        return Err("Diagnostic host accepted a catalog binding.".into());
+    }
+    println!("PASS: catalog binding is unavailable in the diagnostic host");
     let mut incompatible = Request::new(4, Command::Status {});
     incompatible.version += 1;
     let response = host.send(incompatible)?;

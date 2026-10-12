@@ -1,6 +1,6 @@
 //! Construct custom equipment before spawning, so the game initializes quality bookkeeping once.
 use super::{Engine, Result, read, require, u32_at, word};
-use dd_protocol::{CustomItem, WeaponStats};
+use dd_protocol::{CatalogEntry, CustomItem, ItemOptions, PetStats, SpawnOptions, WeaponStats};
 
 const NET: &str = "UDKGame.HeroEquipment.EquipmentNetInfo";
 const NATIVE: &str = "UDKGame.HeroEquipmentNative";
@@ -187,22 +187,75 @@ fn weapon_values(stats: &WeaponStats) -> [(&str, Option<i32>); 10] {
     ]
 }
 
+fn guardian_boost_field(boost_type: u8) -> Result<&'static str> {
+    match boost_type {
+        0 => Ok("WeaponKnockbackBonus"),
+        1 => Ok("WeaponShotsPerSecondBonus"),
+        2 => Ok("WeaponReloadSpeedBonus"),
+        3 => Ok("WeaponChargeSpeedBonus"),
+        _ => Err("This guardian's boost type is unrecognized.".into()),
+    }
+}
+
+fn pet_values(
+    engine: &Engine,
+    item: u32,
+    stats: &PetStats,
+) -> Result<[(&'static str, Option<i32>); 8]> {
+    require(
+        [stats.damage, stats.healing, stats.mana]
+            .iter()
+            .filter(|value| value.is_some())
+            .count()
+            <= 1,
+        "Damage, healing, and mana overrides share storage; request only this pet's supported ability.",
+    )?;
+    let boost_field = if stats.boost.is_some() {
+        const CLASS: &str = "UDKGame.HeroEquipment_Familiar_TowerBooster";
+        const FIELD: &str = "UDKGame.HeroEquipment_Familiar_TowerBooster.MyTowerBoostType";
+        engine.is_a(item, CLASS)?;
+        let field = engine.reflect_field(FIELD, "Core.ByteProperty", 1)?;
+        require(
+            field.count == 1 && field.offset < u32_at(engine.reference(CLASS)? + 0x50)?,
+            "Guardian boost field layout changed.",
+        )?;
+        require(
+            u32_at(engine.reference(FIELD)? + 0x84)?
+                == engine.reference("UDKGame._DataTypes.ETowerBoostType")?,
+            "Guardian boost enum changed.",
+        )?;
+        guardian_boost_field(read(item + field.offset, 1)?[0])?
+    } else {
+        "WeaponKnockbackBonus"
+    };
+    Ok([
+        ("WeaponDamageBonus", stats.damage),
+        ("WeaponDamageBonus", stats.healing),
+        ("WeaponDamageBonus", stats.mana),
+        (boost_field, stats.boost),
+        ("WeaponShotsPerSecondBonus", stats.attack_rate),
+        ("WeaponClipAmmoBonus", stats.range),
+        ("WeaponNumberOfProjectilesBonus", stats.projectiles),
+        ("WeaponSpeedOfProjectilesBonus", stats.projectile_speed),
+    ])
+}
+
 fn overrides(
     engine: &Engine,
     template: u32,
-    kind: u32,
+    entry: &CatalogEntry,
     settings: &CustomItem,
     data: &mut [u8; 412],
 ) -> Result<()> {
-    settings.validate().map_err(str::to_string)?;
-    require(
-        kind == 0 || settings.weapon == WeaponStats::default(),
-        "Weapon bonuses cannot be applied to armor.",
-    )?;
-    require(
-        kind != 0 || settings.resistances == [None; 4],
-        "Armor resistances cannot be applied to a weapon.",
-    )?;
+    dd_protocol::validate_item_options(
+        entry,
+        &SpawnOptions::Equipment {
+            options: ItemOptions::Custom {
+                settings: Box::new(settings.clone()),
+            },
+        },
+    )
+    .map_err(str::to_string)?;
     if let Some(quality) = settings.quality {
         let tiers = super::array(
             engine.field_address(template, "UDKGame.HeroEquipment.EquipLevelRequirements")?,
@@ -243,14 +296,23 @@ fn overrides(
             &format!("This template requires at least {minimum} maximum upgrades."),
         )?;
     }
-    if let Some(damage) = settings.weapon.damage {
+    if let Some(damage) = settings
+        .weapon
+        .damage
+        .or(settings.pet.damage)
+        .or(settings.pet.healing)
+        .or(settings.pet.mana)
+    {
         let minimum = engine.value(template, "UDKGame.HeroEquipment.MinDamageBonus")? as i32;
         require(
             damage >= minimum,
-            &format!("This weapon requires at least {minimum} damage bonus."),
+            &format!("This template requires at least {minimum} for its primary ability bonus."),
         )?;
     }
-    for (name, value) in weapon_values(&settings.weapon) {
+    for (name, value) in weapon_values(&settings.weapon)
+        .into_iter()
+        .chain(pet_values(engine, template, &settings.pet)?)
+    {
         if let Some(value) = value {
             let field = engine.fields[&format!("{NET}.{name}")];
             if field.size == 1 {
@@ -278,12 +340,19 @@ pub(super) fn create(
     engine: &Engine,
     template: u32,
     owner: u32,
-    kind: u32,
+    entry: &CatalogEntry,
     settings: &CustomItem,
 ) -> Result<u32> {
     validate_constructor(engine)?;
     let mut data = net_info(engine, template)?;
-    overrides(engine, template, kind, settings, &mut data)?;
+    overrides(engine, template, entry, settings, &mut data)?;
+    let item = construct(engine, template, owner, &data)?;
+    verify(engine, item, settings)?;
+    Ok(item)
+}
+
+fn construct(engine: &Engine, template: u32, owner: u32, data: &[u8; 412]) -> Result<u32> {
+    validate_constructor(engine)?;
     let mut params = [0u32; 107];
     for (slot, bytes) in params.iter_mut().zip(data.as_chunks::<4>().0) {
         *slot = u32::from_le_bytes(*bytes);
@@ -296,11 +365,50 @@ pub(super) fn create(
     let item = params[106];
     engine.is_a(item, "UDKGame.HeroEquipment")?;
     require(
-        item != template && u32_at(item + 0x38)? == template && u32_at(item + 8)? & 0x400 == 0,
+        item != template
+            && u32_at(item + 0x38)? == template
+            && u32_at(item + 8)? & 0x400 == 0
+            && u32_at(item + 0x34)? == u32_at(template + 0x34)?,
         "Constructor did not return a fresh equipment instance.",
     )?;
-    verify(engine, item, settings)?;
     Ok(item)
+}
+
+/// Mana-token denomination uses the low HighDigitInt word; StoredMana is its high word.
+/// Values above two billion require a separately validated multiword conversion.
+pub(super) fn create_collectible(
+    engine: &Engine,
+    template: u32,
+    owner: u32,
+    stored_mana: Option<i32>,
+) -> Result<u32> {
+    let mut data = net_info(engine, template)?;
+    if let Some(amount) = stored_mana {
+        require(
+            (1..=dd_protocol::items::MANA_TOKEN_LIMIT).contains(&amount),
+            "Mana token value must be between 1 and 2,000,000,000.",
+        )?;
+        put(&mut data, net_offset(engine, "MinimumSellWorth"), amount);
+        put(&mut data, net_offset(engine, "StoredMana"), 0);
+    }
+    let item = construct(engine, template, owner, &data)?;
+    verify_collectible(engine, item, stored_mana)?;
+    Ok(item)
+}
+
+pub(super) fn verify_collectible(
+    engine: &Engine,
+    item: u32,
+    stored_mana: Option<i32>,
+) -> Result<()> {
+    if let Some(amount) = stored_mana {
+        require(
+            engine.value(item, &format!("{NATIVE}.MinimumSellWorth"))? == amount as u32
+                && engine.value(item, &format!("{NATIVE}.StoredMana"))? == 0,
+            "Mana-token denomination readback differs from the request.",
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn verify(engine: &Engine, item: u32, settings: &CustomItem) -> Result<()> {
@@ -328,10 +436,14 @@ pub(super) fn verify(engine: &Engine, item: u32, settings: &CustomItem) -> Resul
             )?;
         }
     }
-    for (name, expected) in weapon_values(&settings.weapon).into_iter().chain([
-        ("Level", settings.upgrade_level),
-        ("MaxEquipmentLevel", settings.max_upgrades),
-    ]) {
+    for (name, expected) in weapon_values(&settings.weapon)
+        .into_iter()
+        .chain(pet_values(engine, item, &settings.pet)?)
+        .chain([
+            ("Level", settings.upgrade_level),
+            ("MaxEquipmentLevel", settings.max_upgrades),
+        ])
+    {
         if let Some(expected) = expected {
             require(
                 value(name, 0) == expected,
@@ -360,12 +472,12 @@ pub(super) fn roll(
     engine: &Engine,
     template: u32,
     owner: u32,
-    kind: u32,
+    entry: &CatalogEntry,
     strength: f32,
     quality: Option<dd_protocol::Quality>,
     conditions: dd_protocol::LootConditions,
 ) -> Result<Option<u32>> {
-    const RANDOMIZE: &str = "UDKGame.HeroEquipment.AddRandomizeValues";
+    let randomize = engine.method(template, "AddRandomizeValues")?;
     require(
         !engine.flag(
             template,
@@ -373,11 +485,16 @@ pub(super) fn roll(
         )?,
         "This template disables natural randomization. Use Template defaults or Custom.",
     )?;
-    let function = engine.reference(RANDOMIZE)?;
+    let function = engine.reference(&randomize)?;
+    let expected_flags = if randomize == "UDKGame.HeroEquipment.AddRandomizeValues" {
+        0x824002
+    } else {
+        0x24002
+    };
     let header = read(function + 0x90, 0x18)?;
     require(
         u32_at(function + 0x34)? == engine.reference("Core.Function")?
-            && word(&header, 0) == 0x824002
+            && word(&header, 0) == expected_flags
             && u16::from_le_bytes([header[4], header[5]]) == 0
             && u16::from_le_bytes([header[0x12], header[0x13]]) == 24
             && u16::from_le_bytes([header[0x14], header[0x15]]) == u16::MAX,
@@ -394,7 +511,7 @@ pub(super) fn roll(
     .iter()
     .enumerate()
     {
-        let path = format!("{RANDOMIZE}.{name}");
+        let path = format!("{randomize}.{name}");
         let field = engine.reflect_field(&path, kind, 4)?;
         require(
             field.offset == index as u32 * 4
@@ -405,7 +522,7 @@ pub(super) fn roll(
         )?;
     }
     let started = std::time::Instant::now();
-    let item = create(engine, template, owner, kind, &CustomItem::default())?;
+    let item = create(engine, template, owner, entry, &CustomItem::default())?;
     let tavern = conditions == dd_protocol::LootConditions::TavernTesting;
     if tavern {
         super::tavern::prepare(engine, template, item)?;
@@ -439,6 +556,17 @@ pub(super) fn roll(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn guardian_boost_uses_the_field_that_init_from_net_info_preserves() {
+        assert_eq!(guardian_boost_field(0).unwrap(), "WeaponKnockbackBonus");
+        assert_eq!(
+            guardian_boost_field(1).unwrap(),
+            "WeaponShotsPerSecondBonus"
+        );
+        assert_eq!(guardian_boost_field(2).unwrap(), "WeaponReloadSpeedBonus");
+        assert_eq!(guardian_boost_field(3).unwrap(), "WeaponChargeSpeedBonus");
+        assert!(guardian_boost_field(4).is_err());
+    }
     #[test]
     fn signed_byte_boundaries_survive_the_game_encoding() {
         for value in [-127, -1, 0, 1, 128] {

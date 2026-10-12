@@ -13,8 +13,10 @@ name = "dd-adapter-host"
 path = "src/bin/host.rs"
 
 [dependencies]
+dd-catalog.workspace = true
 dd-protocol.workspace = true
 sha2.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

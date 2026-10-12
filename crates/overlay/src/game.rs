@@ -6,7 +6,7 @@ use std::{
 };
 
 pub const ANALYZED_SHA256: &str =
-    "4e4b03765c9e74415e27e36d952ebecd86a655ca27d8a46b5285279773e6d0f4";
+    "2b43fef8ecf629d72b9a3fc032a65d6bf0298fd983301e97cdbfb45fd6314883";
 
 pub fn find_installation() -> Option<PathBuf> {
     let mut roots = Vec::new();
@@ -64,7 +64,7 @@ pub fn inspect(root: &Path) -> io::Result<String> {
     }
     let hash = format!("{:x}", digest.finalize());
     if hash == ANALYZED_SHA256 {
-        Ok("Recognized 32-bit build. Start local single-player, then connect to the game.".into())
+        Ok("Recognized 32-bit build 25887270. Start local single-player, then connect to validate the running game.".into())
     } else {
         Ok(format!(
             "Unrecognized build ({hash}). Item requests are disabled."

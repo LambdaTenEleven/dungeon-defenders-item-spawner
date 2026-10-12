@@ -5,10 +5,13 @@ pub mod attachment;
 #[cfg(windows)]
 mod bridge;
 #[cfg(windows)]
+mod catalog_runtime;
+#[cfg(windows)]
 mod engine;
 
 use dd_protocol::{
-    AdapterStatus, Command, ErrorCode, Rejection, Request, Response, VERSION, validate_grant,
+    AdapterStatus, Command, ErrorCode, ItemInspection, Rejection, Request, Response, VERSION,
+    validate_grant,
 };
 
 pub fn status() -> AdapterStatus {
@@ -24,7 +27,10 @@ pub fn status() -> AdapterStatus {
         bits: usize::BITS,
         diagnostic,
         can_give: false,
+        catalog: None,
         roll_matched: None,
+        inspection: None,
+        spawn: None,
         message: if diagnostic {
             "Isolated adapter test passed. Dungeon Defenders is not connected; item granting is unavailable."
         } else {
@@ -39,6 +45,7 @@ pub fn handle(request: Request) -> Response {
         Err(Rejection {
             code,
             message: message.into(),
+            spawn: None,
         })
     };
     let result = if request.version != VERSION {
@@ -49,16 +56,47 @@ pub fn handle(request: Request) -> Response {
     } else {
         match request.command {
             Command::Status {} | Command::Shutdown {} => Ok(status()),
-            Command::Give {
+            Command::BindCatalog { catalog } => match catalog.validate() {
+                Err(message) => rejection(ErrorCode::InvalidRequest, message),
+                Ok(()) => rejection(
+                    ErrorCode::IntegrationUnavailable,
+                    "Isolated diagnostics cannot bind a game catalog.",
+                ),
+            },
+            Command::Spawn {
+                catalog,
                 template,
                 quantity,
                 options,
-            } => match validate_grant(&template, quantity).and_then(|()| options.validate()) {
+            } => match catalog
+                .validate()
+                .and_then(|()| validate_grant(&template, quantity))
+                .and_then(|()| options.validate())
+            {
                 Err(message) => rejection(ErrorCode::InvalidRequest, message),
                 Ok(()) => rejection(
                     ErrorCode::IntegrationUnavailable,
                     "Isolated diagnostics cannot spawn items. Use Connect to game from the overlay.",
                 ),
+            },
+            Command::InspectItem { catalog, template } => match catalog
+                .validate()
+                .and_then(|()| validate_grant(&template, 1))
+            {
+                Err(message) => rejection(ErrorCode::InvalidRequest, message),
+                Ok(()) => {
+                    let mut state = status();
+                    state.inspection = Some(ItemInspection {
+                        template,
+                        available: false,
+                        reason: Some(
+                            "Isolated diagnostics cannot inspect or authorize any game item."
+                                .into(),
+                        ),
+                        capabilities: Default::default(),
+                    });
+                    Ok(state)
+                }
             },
         }
     };
@@ -78,6 +116,7 @@ fn serve() -> std::io::Result<()> {
         pipe.accept()?;
         let stop = match read_frame::<Request>(&mut pipe) {
             Ok(request) => {
+                pipe.prepare_response(&request);
                 let stop =
                     request.version == VERSION && matches!(request.command, Command::Shutdown {});
                 let response = handle(request);
@@ -111,15 +150,23 @@ pub extern "system" fn dd_adapter_run() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    fn key() -> dd_protocol::CatalogKey {
+        dd_protocol::CatalogKey {
+            installation_id: "0".repeat(64),
+            generation: "1".repeat(64),
+        }
+    }
     #[test]
     fn unverified_backend_never_reports_success() {
         let response = handle(Request::new(
             7,
-            Command::Give {
+            Command::Spawn {
+                catalog: key(),
                 template: "Package.Item".into(),
                 quantity: 1,
-                options: dd_protocol::ItemOptions::default(),
+                options: dd_protocol::SpawnOptions::Equipment {
+                    options: Default::default(),
+                },
             },
         ));
         assert_eq!(response.id, 7);
@@ -129,27 +176,53 @@ mod tests {
         );
         assert!(!status().can_give);
     }
-
     #[test]
     fn rejects_version_before_dispatch() {
         let mut request = Request::new(8, Command::Status {});
-        request.version = VERSION + 1;
+        request.version = VERSION - 1;
         assert_eq!(
             handle(request).result.unwrap_err().code,
             ErrorCode::ProtocolMismatch
         );
     }
-
     #[test]
     fn rejects_invalid_grant() {
         let response = handle(Request::new(
             9,
-            Command::Give {
+            Command::Spawn {
+                catalog: key(),
                 template: "A.B".into(),
                 quantity: 0,
-                options: dd_protocol::ItemOptions::default(),
+                options: dd_protocol::SpawnOptions::Equipment {
+                    options: Default::default(),
+                },
             },
         ));
         assert_eq!(response.result.unwrap_err().code, ErrorCode::InvalidRequest);
+    }
+    #[test]
+    fn diagnostic_inspection_never_authorizes_any_item() {
+        let state = handle(Request::new(
+            10,
+            Command::InspectItem {
+                catalog: key(),
+                template: "Unknown.Template".into(),
+            },
+        ))
+        .result
+        .unwrap();
+        assert!(!state.can_give);
+        assert!(!state.inspection.unwrap().available);
+        assert!(state.spawn.is_none());
+    }
+    #[test]
+    fn diagnostics_cannot_bind_catalog() {
+        assert_eq!(
+            handle(Request::new(11, Command::BindCatalog { catalog: key() }))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::IntegrationUnavailable
+        );
     }
 }

@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub const STAT_LIMIT: i32 = 9_999;
 pub const DAMAGE_LIMIT: i32 = 1_000_000;
 pub const UPGRADE_LIMIT: i32 = 9_999;
+/// Denominations covered by the verified low-component HighDigitInt encoding.
+pub const MANA_TOKEN_LIMIT: i32 = 2_000_000_000;
 pub const HERO_STATS: [&str; 10] = [
     "Hero health",
     "Hero speed",
@@ -52,6 +54,22 @@ pub struct CustomItem {
     pub upgrade_level: Option<i32>,
     pub max_upgrades: Option<i32>,
     pub weapon: WeaponStats,
+    pub pet: PetStats,
+}
+
+/// Semantic familiar fields; the adapter maps only reviewed class-specific
+/// meanings onto the game's serialized equipment fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PetStats {
+    pub damage: Option<i32>,
+    pub healing: Option<i32>,
+    pub mana: Option<i32>,
+    pub boost: Option<i32>,
+    pub attack_rate: Option<i32>,
+    pub range: Option<i32>,
+    pub projectiles: Option<i32>,
+    pub projectile_speed: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +244,27 @@ impl CustomItem {
                 "Small weapon bonuses must be between -127 and 128 to survive serialization.",
             );
         }
+        let p = &self.pet;
+        if ![p.damage, p.healing, p.mana, p.range]
+            .iter()
+            .all(|v| range(*v, 0, DAMAGE_LIMIT))
+            || !range(p.projectile_speed, -DAMAGE_LIMIT, DAMAGE_LIMIT)
+        {
+            return Err(
+                "Pet damage/healing/mana/range must be 0..1000000; projectile speed must be -1000000..1000000.",
+            );
+        }
+        if ![p.attack_rate, p.projectiles]
+            .iter()
+            .all(|v| range(*v, -127, 128))
+        {
+            return Err("Small pet bonuses must be between -127 and 128 to survive serialization.");
+        }
+        if !range(p.boost, 0, 128) {
+            return Err(
+                "Guardian boost must be between 0 and 128 to survive subclass initialization.",
+            );
+        }
         Ok(())
     }
 }
@@ -233,6 +272,27 @@ impl CustomItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pet_stats_enforce_serialized_and_subclass_bounds() {
+        let mut settings = CustomItem::default();
+        settings.pet.boost = Some(128);
+        settings.pet.range = Some(DAMAGE_LIMIT);
+        settings.pet.attack_rate = Some(-127);
+        assert!(settings.validate().is_ok());
+        settings.pet.boost = Some(129);
+        assert!(settings.validate().is_err());
+        settings.pet.boost = Some(-1);
+        assert!(settings.validate().is_err());
+        settings.pet.boost = None;
+        settings.pet.projectiles = Some(129);
+        assert!(settings.validate().is_err());
+        settings.pet.projectiles = None;
+        settings.pet.healing = Some(-1);
+        assert!(settings.validate().is_err());
+        let omitted: CustomItem = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted.pet, PetStats::default());
+    }
 
     #[test]
     fn rejects_values_that_would_wrap_or_invalidate_the_roll() {

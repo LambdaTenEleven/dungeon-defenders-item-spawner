@@ -367,15 +367,27 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 name = "dd-adapter"
 version = "0.2.0"
 dependencies = [
+ "dd-catalog",
  "dd-protocol",
+ "serde_json",
  "sha2",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "dd-catalog"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
 name = "dd-overlay"
 version = "0.2.0"
 dependencies = [
+ "dd-catalog",
  "dd-protocol",
  "eframe",
  "sha2",
@@ -386,6 +398,7 @@ dependencies = [
 name = "dd-protocol"
 version = "0.2.0"
 dependencies = [
+ "dd-catalog",
  "serde",
  "serde_json",
  "windows-sys 0.61.2",

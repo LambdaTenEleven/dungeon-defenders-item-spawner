@@ -5,12 +5,16 @@ mod connection;
 mod diagnostics;
 mod editor;
 mod game;
+mod inspection;
 mod number_input;
 mod search;
 
 use catalog::{Filter, Kind, Template};
 use connection::GameConnection;
-use dd_protocol::{AdapterStatus, Command, MAX_QUANTITY, validate_grant};
+use dd_catalog::{CatalogSnapshot, ScanProgress};
+use dd_protocol::{
+    AdapterStatus, Command, ItemCapabilities, MAX_QUANTITY, validate_grant, validate_item_options,
+};
 use diagnostics::DiagnosticHost;
 use eframe::egui::{self, Color32, RichText};
 use std::{
@@ -31,12 +35,27 @@ const CONNECTED: Color32 = Color32::from_rgb(120, 200, 140);
 enum Event {
     Progress(String),
     Adapter(Result<(DiagnosticHost, AdapterStatus), String>),
-    Game(Result<String, String>),
+    ScanProgress {
+        generation: u64,
+        progress: ScanProgress,
+    },
+    Scanned {
+        generation: u64,
+        game_status: String,
+        result: Result<CatalogSnapshot, String>,
+    },
     Connected(Result<(GameConnection, AdapterStatus), String>),
     Spawned(Result<AdapterStatus, String>),
+    Inspected {
+        generation: u64,
+        result: Result<AdapterStatus, String>,
+    },
 }
 
 struct Overlay {
+    catalog: Option<Arc<CatalogSnapshot>>,
+    catalog_path: String,
+    scan: ScanState,
     templates: Vec<Template>,
     filter: Filter,
     /// Template indices matching `filter`, rebuilt only when the filter changes.
@@ -46,6 +65,7 @@ struct Overlay {
     template: String,
     quantity: i32,
     editor: editor::ItemEditor,
+    inspection: inspection::InspectionState,
     install_path: String,
     game_status: String,
     game_running: bool,
@@ -62,19 +82,67 @@ struct Overlay {
     last_process_check: Instant,
 }
 
+/// A cancelled or superseded worker can never publish over a newer installation.
+#[derive(Default)]
+struct ScanState {
+    generation: u64,
+    cancel: Option<Arc<AtomicBool>>,
+    progress: String,
+    summary: Option<String>,
+    failed: bool,
+}
+
+impl ScanState {
+    fn cancel(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn begin(&mut self) -> (u64, Arc<AtomicBool>) {
+        self.cancel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(Arc::clone(&cancel));
+        self.failed = false;
+        self.summary = None;
+        self.progress = "Checking installed packages and the local catalog cache…".into();
+        (self.generation, cancel)
+    }
+
+    fn accepts(&self, generation: u64) -> bool {
+        self.generation == generation && self.cancel.is_some()
+    }
+
+    fn record_progress(&mut self, generation: u64, progress: ScanProgress) {
+        if !self.accepts(generation) {
+            return;
+        }
+        if progress.total > 0 && progress.completed == progress.total {
+            self.summary = Some(progress.message.clone());
+        }
+        self.progress = if progress.total == 0 {
+            progress.message
+        } else {
+            format!(
+                "{}/{}: {}",
+                progress.completed, progress.total, progress.message
+            )
+        };
+    }
+}
+
 impl Overlay {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let (tx, rx) = mpsc::channel();
-        let templates = catalog::templates();
-        let template = templates
-            .iter()
-            .find(|item| item.name == "SwordOfEmbers")
-            .unwrap_or(&templates[0])
-            .path
-            .into();
+        let templates = Vec::new();
+        let template = String::new();
         let filter = Filter::default();
         let mut app = Self {
+            catalog: None,
+            catalog_path: String::new(),
+            scan: ScanState::default(),
             shown: filter.apply(&templates),
             shown_for: filter.clone(),
             filter,
@@ -82,6 +150,7 @@ impl Overlay {
             template,
             quantity: 1,
             editor: editor::ItemEditor::default(),
+            inspection: inspection::InspectionState::default(),
             install_path: game::find_installation()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
@@ -100,25 +169,85 @@ impl Overlay {
             last_process_check: Instant::now(),
         };
         if !app.install_path.is_empty() {
-            app.inspect_game(cc.egui_ctx.clone());
+            app.scan_catalog(cc.egui_ctx.clone(), false);
         }
         app
     }
 
-    fn inspect_game(&mut self, context: egui::Context) {
-        self.busy = true;
+    fn scan_catalog(&mut self, context: egui::Context, force: bool) {
+        if self.busy {
+            return;
+        }
+        self.disconnect_catalog();
+        let (generation, cancel) = self.scan.begin();
         self.game_status = "Checking the game executable…".into();
-        let path = self.install_path.clone();
+        self.catalog_path = self.install_path.clone();
+        let path = self.catalog_path.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result = game::inspect(Path::new(&path)).map_err(|e| e.to_string());
-            let _ = tx.send(Event::Game(result));
+            let game_status = game::inspect(Path::new(&path))
+                .unwrap_or_else(|e| format!("Could not inspect game: {e}"));
+            let result = dd_catalog::scan(Path::new(&path), force, &cancel, |progress| {
+                let _ = tx.send(Event::ScanProgress {
+                    generation,
+                    progress,
+                });
+                context.request_repaint();
+            });
+            let _ = tx.send(Event::Scanned {
+                generation,
+                game_status,
+                result,
+            });
             context.request_repaint();
         });
     }
 
+    fn disconnect_catalog(&mut self) {
+        if let Some(cancel) = &self.search_cancel {
+            cancel.store(true, Ordering::Release);
+        }
+        self.connection = None;
+        self.inspection.invalidate();
+        self.can_spawn = false;
+    }
+
+    fn catalog_ready(&self) -> bool {
+        self.scan.cancel.is_none()
+            && !self.scan.failed
+            && self.catalog_path == self.install_path
+            && self
+                .catalog
+                .as_ref()
+                .is_some_and(|catalog| catalog.issues.is_empty() && !catalog.entries.is_empty())
+    }
+
+    fn publish_catalog(&mut self, snapshot: CatalogSnapshot) {
+        self.disconnect_catalog();
+        self.templates = catalog::templates(&snapshot.entries);
+        if !self.templates.iter().any(|item| item.path == self.template) {
+            self.template = self
+                .templates
+                .iter()
+                .find(|item| item.unavailable_reason.is_none())
+                .or_else(|| self.templates.first())
+                .map_or_else(String::new, |item| item.path.clone());
+        }
+        self.shown = self.filter.apply(&self.templates);
+        self.shown_for = self.filter.clone();
+        self.editor = editor::ItemEditor::default();
+        self.catalog = Some(Arc::new(snapshot));
+        self.adapter_status = if self.catalog_ready() {
+            "Catalog refreshed. Connect to inspect items in the game."
+        } else {
+            "Catalog available for browsing. Resolve the scan issues before connecting."
+        }
+        .into();
+    }
+
     fn test_adapter(&mut self, context: egui::Context) {
         self.connection = None;
+        self.inspection.invalidate();
         self.can_spawn = false;
         self.diagnostic = None;
         self.busy = true;
@@ -131,8 +260,13 @@ impl Overlay {
     }
 
     fn connect(&mut self, context: egui::Context) {
+        if !self.catalog_ready() {
+            return;
+        }
+        let catalog = self.catalog.as_ref().unwrap().key.clone();
         self.diagnostic = None;
         self.connection = None;
+        self.inspection.invalidate();
         self.can_spawn = false;
         self.busy = true;
         self.adapter_status =
@@ -140,7 +274,7 @@ impl Overlay {
                 .into();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Event::Connected(GameConnection::start()));
+            let _ = tx.send(Event::Connected(GameConnection::start(catalog)));
             context.request_repaint();
         });
     }
@@ -152,8 +286,49 @@ impl Overlay {
             .find(|item| item.path == self.template)
     }
 
-    fn is_weapon(&self) -> bool {
-        self.current().is_none_or(|item| item.kind == Kind::Weapon)
+    fn capabilities(&self) -> Option<ItemCapabilities> {
+        let item = self.current()?;
+        Some(
+            self.inspection
+                .result
+                .as_ref()
+                .filter(|result| result.template == self.template)
+                .map_or(item.capabilities, |result| result.capabilities),
+        )
+    }
+
+    fn sync_selection(&mut self) {
+        self.inspection.select(&self.template);
+        if let Some(item) = self.current() {
+            let kind = item.kind;
+            let caps = self.capabilities().unwrap();
+            self.editor.select(kind, caps);
+        }
+    }
+
+    fn inspect_selection(&mut self, context: egui::Context) {
+        if self.busy
+            || !self.catalog_ready()
+            || self
+                .current()
+                .is_none_or(|item| item.kind == Kind::Unknown || item.unavailable_reason.is_some())
+        {
+            return;
+        }
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        let pid = connection.pid;
+        let catalog = connection.catalog.clone();
+        let Some((generation, template)) = self.inspection.begin(Instant::now()) else {
+            return;
+        };
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = connection::request(pid, Command::InspectItem { catalog, template });
+            let _ = tx.send(Event::Inspected { generation, result });
+            context.request_repaint();
+        });
     }
 
     fn request_quantity(&self) -> u8 {
@@ -164,16 +339,34 @@ impl Overlay {
         let Some(connection) = &self.connection else {
             return;
         };
+        if self.busy
+            || !self.catalog_ready()
+            || !self.can_spawn
+            || !self.inspection.available(&self.template)
+        {
+            return;
+        }
+        let Some(item) = self.current() else {
+            return;
+        };
+        let options = self.editor.options(item.kind, self.capabilities().unwrap());
+        if validate_grant(&self.template, self.request_quantity())
+            .and_then(|()| validate_item_options(&item.entry, &options))
+            .is_err()
+        {
+            return;
+        }
         let pid = connection.pid;
-        let command = Command::Give {
+        let command = Command::Spawn {
+            catalog: connection.catalog.clone(),
             template: self.template.clone(),
             quantity: self.request_quantity(),
-            options: self.editor.options(self.is_weapon()),
+            options,
         };
         self.busy = true;
         self.adapter_status = "Spawning pickup…".into();
         let cancel = Arc::new(AtomicBool::new(false));
-        if let Command::Give { options, .. } = &command
+        if let Command::Spawn { options, .. } = &command
             && options.needs_search()
         {
             self.search_cancel = Some(Arc::clone(&cancel));
@@ -193,6 +386,7 @@ impl Overlay {
 
 impl Drop for Overlay {
     fn drop(&mut self) {
+        self.scan.cancel();
         if let Some(cancel) = &self.search_cancel {
             cancel.store(true, Ordering::Release);
         }
@@ -202,17 +396,85 @@ impl Drop for Overlay {
 impl eframe::App for Overlay {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         while let Ok(event) = self.rx.try_recv() {
+            match event {
+                Event::ScanProgress {
+                    generation,
+                    progress,
+                } => {
+                    self.scan.record_progress(generation, progress);
+                    continue;
+                }
+                Event::Scanned {
+                    generation,
+                    game_status,
+                    result,
+                } => {
+                    if self.scan.accepts(generation) {
+                        self.scan.cancel = None;
+                        self.game_status = game_status;
+                        match result {
+                            Ok(snapshot) => {
+                                self.scan.progress = if snapshot.issues.is_empty()
+                                    && snapshot.entries.is_empty()
+                                {
+                                    "No item candidates were discovered in this installation. Spawning is disabled.".into()
+                                } else if snapshot.issues.is_empty() {
+                                    self.scan.summary.take().unwrap_or_else(|| {
+                                        format!(
+                                            "Local catalog ready: {} items from {} packages.",
+                                            snapshot.entries.len(),
+                                            snapshot.packages.len()
+                                        )
+                                    })
+                                } else {
+                                    format!(
+                                        "Incomplete catalog: {} items, {} package issues. Spawning is disabled. {}",
+                                        snapshot.entries.len(),
+                                        snapshot.issues.len(),
+                                        self.scan.summary.take().unwrap_or_default()
+                                    )
+                                };
+                                self.publish_catalog(snapshot);
+                            }
+                            Err(error) => {
+                                self.scan.failed = true;
+                                self.scan.progress = format!("Catalog scan failed: {error}.");
+                                if self.catalog.is_some() {
+                                    self.scan.progress.push_str(
+                                        " Previous entries remain available for browsing only.",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            if let Event::Inspected { generation, result } = event {
+                let ready = result.as_ref().ok().map(|status| status.can_give);
+                let result = result.and_then(|status| {
+                    status
+                        .inspection
+                        .ok_or_else(|| "Adapter omitted selected item inspection.".into())
+                });
+                if self.inspection.complete(generation, result)
+                    && let Some(ready) = ready
+                {
+                    self.can_spawn = ready;
+                }
+                continue;
+            }
             if let Event::Progress(message) = event {
                 self.adapter_status = message;
                 continue;
             }
             self.busy = false;
             match event {
-                Event::Progress(_) => unreachable!(),
-                Event::Game(result) => {
-                    self.game_status =
-                        result.unwrap_or_else(|e| format!("Could not inspect game: {e}"))
-                }
+                Event::Progress(_)
+                | Event::Inspected { .. }
+                | Event::ScanProgress { .. }
+                | Event::Scanned { .. } => unreachable!(),
                 Event::Adapter(Ok((host, status))) => {
                     self.adapter_status = status.message;
                     self.diagnostic = Some(host);
@@ -222,15 +484,18 @@ impl eframe::App for Overlay {
                     self.can_spawn = status.can_give;
                     self.adapter_status = status.message;
                     self.connection = Some(connection);
+                    self.inspection.invalidate();
                 }
                 Event::Connected(Err(error)) => self.adapter_status = error,
                 Event::Spawned(Ok(status)) => {
                     self.search_cancel = None;
+                    self.inspection.invalidate();
                     self.can_spawn = status.can_give;
                     self.adapter_status = status.message;
                 }
                 Event::Spawned(Err(error)) => {
                     self.search_cancel = None;
+                    self.inspection.invalidate();
                     self.adapter_status = error;
                     self.can_spawn = false;
                 }
@@ -245,6 +510,7 @@ impl eframe::App for Overlay {
                 .is_some_and(|connection| !connection.is_running())
             {
                 self.connection = None;
+                self.inspection.invalidate();
                 if let Some(cancel) = &self.search_cancel {
                     cancel.store(true, Ordering::Release);
                 }
@@ -273,6 +539,7 @@ impl eframe::App for Overlay {
             .default_size(380.0)
             .min_size(260.0)
             .show(ui, |ui| self.browser(ui));
+        self.sync_selection();
         egui::CentralPanel::default().show(ui, |ui| {
             egui::Panel::bottom("spawn-bar").show(ui, |ui| self.spawn_bar(ui));
             egui::ScrollArea::vertical()
@@ -280,10 +547,53 @@ impl eframe::App for Overlay {
                 .auto_shrink([false, false])
                 .show(ui, |ui| self.details(ui));
         });
+        self.inspect_selection(ui.ctx().clone());
     }
 }
 
 impl Overlay {
+    fn catalog_status(&mut self, ui: &mut egui::Ui) {
+        if !self.scan.progress.is_empty() {
+            ui.label(&self.scan.progress);
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.busy && !self.install_path.is_empty(),
+                    egui::Button::new("Rebuild catalog"),
+                )
+                .clicked()
+            {
+                self.scan_catalog(ui.ctx().clone(), true);
+            }
+            if self.scan.cancel.is_some() && ui.button("Cancel scan").clicked() {
+                self.scan.cancel();
+                self.scan.failed = true;
+                self.scan.progress = "Scan cancelled. Scan again before connecting.".into();
+                if self.catalog.is_some() {
+                    self.scan
+                        .progress
+                        .push_str(" Previous entries are available for browsing.");
+                }
+            }
+        });
+        if let Some(catalog) = &self.catalog {
+            if !catalog.issues.is_empty() {
+                egui::CollapsingHeader::new("Package scan issues").show(ui, |ui| {
+                    for issue in &catalog.issues {
+                        ui.colored_label(WARNING, issue);
+                    }
+                });
+            }
+            if self.catalog_path != self.install_path
+                || self.scan.failed
+                || self.scan.cancel.is_some()
+            {
+                ui.colored_label(WARNING, "Displayed entries are not validated for spawning. Refresh the selected installation.");
+            }
+        }
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -301,7 +611,7 @@ impl Overlay {
             let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
             ui.painter().circle_filled(dot.center(), 4.0, color);
             ui.colored_label(color, status);
-            if self.busy {
+            if self.busy || self.scan.cancel.is_some() {
                 ui.spinner();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -321,7 +631,13 @@ impl Overlay {
                     "Connect to game"
                 };
                 if ui
-                    .add_enabled(!self.busy, egui::Button::new(connect))
+                    .add_enabled(
+                        !self.busy && self.catalog_ready(),
+                        egui::Button::new(connect),
+                    )
+                    .on_disabled_hover_text(
+                        "A complete catalog for the selected installation is required.",
+                    )
                     .clicked()
                 {
                     self.connect(ui.ctx().clone());
@@ -339,20 +655,34 @@ impl Overlay {
         ui.label("Game installation");
         ui.horizontal(|ui| {
             let width = ui.available_width() - 86.0;
-            ui.add(egui::TextEdit::singleline(&mut self.install_path).desired_width(width));
             if ui
-                .add_enabled(!self.busy, egui::Button::new("Check"))
+                .add_enabled(
+                    !self.busy,
+                    egui::TextEdit::singleline(&mut self.install_path).desired_width(width),
+                )
+                .changed()
+            {
+                self.scan.cancel();
+                self.scan.failed = true;
+                self.scan.progress =
+                    "Installation changed. Scan this folder before connecting.".into();
+                self.disconnect_catalog();
+            }
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Scan"))
                 .clicked()
             {
-                self.inspect_game(ui.ctx().clone());
+                self.scan_catalog(ui.ctx().clone(), false);
             }
         });
         ui.label(&self.game_status);
+        self.catalog_status(ui);
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let disconnect = egui::Button::new("Disconnect game");
             if self.connection.is_some() && ui.add_enabled(!self.busy, disconnect).clicked() {
                 self.connection = None;
+                self.inspection.invalidate();
                 self.can_spawn = false;
                 self.adapter_status =
                     "Game disconnected. Adapter stays idle until the game exits.".into();
@@ -372,30 +702,47 @@ impl Overlay {
 
     fn browser(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
+        if !self.catalog_ready() {
+            self.catalog_status(ui);
+            ui.separator();
+        }
         ui.add(
             egui::TextEdit::singleline(&mut self.filter.text)
                 .hint_text("Search name or package…")
                 .desired_width(f32::INFINITY),
         );
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let mut kind = self.filter.kind;
             ui.selectable_value(&mut kind, None, "All");
-            ui.selectable_value(&mut kind, Some(Kind::Weapon), "Weapons");
-            ui.selectable_value(&mut kind, Some(Kind::Armor), "Armor");
+            for option in catalog::KINDS {
+                ui.selectable_value(&mut kind, Some(option), option.label());
+            }
             self.filter.set_kind(kind);
         });
         if let Some(kind) = self.filter.kind {
             let filter = &mut self.filter;
-            chips(ui, kind.group_title(), kind.groups(), &mut filter.groups);
             chips(
                 ui,
-                kind.variant_title(),
-                kind.variants(),
-                &mut filter.variants,
+                catalog::group_title(kind),
+                &catalog::groups(kind, &self.templates),
+                &mut filter.groups,
             );
+            let variants = catalog::variants(kind);
+            if !variants.is_empty() {
+                chips(
+                    ui,
+                    if kind == Kind::Armor {
+                        "Material"
+                    } else {
+                        "Variant"
+                    },
+                    &variants,
+                    &mut filter.variants,
+                );
+            }
         } else {
-            ui.weak("Choose Weapons or Armor to filter by hero, slot, variant, or material.");
+            ui.weak("Choose a category to filter by hero, slot, or item family.");
         }
         ui.horizontal(|ui| {
             if self.filter.is_active() && ui.small_button("Clear filters").clicked() {
@@ -407,7 +754,7 @@ impl Overlay {
             }
             let count = format!("{} of {} shown", self.shown.len(), self.templates.len());
             ui.weak(count).on_hover_text(
-                "Availability is checked when spawning; not every template has been tested.",
+                "Discovered items are inspected before spawning. Unknown item types remain visible and unavailable.",
             );
         });
         ui.separator();
@@ -416,18 +763,26 @@ impl Overlay {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if self.shown.is_empty() {
-                    ui.weak("No equipment matches. Clear a filter to see more.");
+                    ui.weak(if self.templates.is_empty() {
+                        "Scan the game installation to discover items."
+                    } else {
+                        "No items match. Clear a filter to see more."
+                    });
                 }
                 for &index in &self.shown {
                     let item = &self.templates[index];
                     let selected = self.template == item.path;
                     let row = ui.horizontal(|ui| {
-                        let name = ui.selectable_label(selected, item.name);
+                        let name = ui.selectable_label(selected, &item.name);
                         ui.weak(&item.tags);
+                        if let Some(reason) = &item.unavailable_reason {
+                            ui.colored_label(WARNING, "Unavailable")
+                                .on_hover_text(reason);
+                        }
                         name
                     });
-                    if row.inner.on_hover_text(item.path).clicked() {
-                        self.template = item.path.into();
+                    if row.inner.on_hover_text(&item.path).clicked() {
+                        self.template = item.path.clone();
                     }
                 }
             });
@@ -435,14 +790,22 @@ impl Overlay {
 
     fn details(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
+        if self.templates.is_empty() {
+            ui.heading("Item catalog");
+            ui.weak("Select the Dungeon Defenders installation in Settings and complete a scan to browse its items.");
+            return;
+        }
         match self.current() {
             Some(item) => {
-                ui.heading(item.name);
+                ui.heading(&item.name);
                 ui.weak(format!("{} · {}", item.kind.label(), item.tags));
             }
             None => {
-                ui.heading("Custom template");
-                ui.weak("Not in the bundled catalog. Availability is checked when spawning.");
+                ui.heading("Unknown template");
+                ui.colored_label(
+                    ERROR,
+                    "This path is not in the shared catalog and cannot be spawned.",
+                );
             }
         }
         ui.label(RichText::new(&self.template).small().monospace().weak());
@@ -454,28 +817,82 @@ impl Overlay {
                     .font(egui::TextStyle::Monospace),
             );
         });
+        self.sync_selection();
         ui.separator();
-        let weapon = self.is_weapon();
-        self.editor.show(ui, weapon);
+        if let Some(item) = self.current() {
+            let kind = item.kind;
+            let caps = self.capabilities().unwrap();
+            let excluded = item.unavailable_reason.clone().or_else(|| {
+                (kind == Kind::Unknown)
+                    .then(|| "This item type is not classified and cannot be spawned.".into())
+            });
+            egui::CollapsingHeader::new("Template source").show(ui, |ui| {
+                ui.label(format!("Class: {}", item.class_name));
+                ui.label(format!("Packages: {}", item.source_packages.join(", ")));
+                ui.label(format!("Classification: {}", item.classification_rule));
+            });
+            let options_available = excluded.is_none() && kind != Kind::Unknown;
+            if let Some(reason) = excluded {
+                ui.colored_label(WARNING, reason);
+            } else if self.connection.is_some() {
+                let color = if self.inspection.available(&self.template) {
+                    CONNECTED
+                } else {
+                    WARNING
+                };
+                ui.colored_label(color, self.inspection.reason());
+                if ui
+                    .add_enabled(
+                        !self.busy && !self.inspection.pending(),
+                        egui::Button::new("Recheck availability"),
+                    )
+                    .clicked()
+                {
+                    self.inspection.invalidate();
+                }
+            } else {
+                ui.weak("Connect to inspect this item in the current game context.");
+            }
+            ui.add_space(6.0);
+            if options_available {
+                self.editor.show(ui, kind, caps);
+            }
+        }
     }
 
     fn spawn_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
-        let weapon = self.is_weapon();
-        let valid = validate_grant(&self.template, self.request_quantity())
-            .and_then(|()| self.editor.options(weapon).validate());
+        if self.templates.is_empty() {
+            ui.weak("Spawning is unavailable until the catalog contains a supported item.");
+            return;
+        }
+        let valid = validate_grant(&self.template, self.request_quantity()).and_then(|()| {
+            let item = self
+                .current()
+                .ok_or("Select an item from the shared catalog.")?;
+            validate_item_options(
+                &item.entry,
+                &self.editor.options(item.kind, self.capabilities().unwrap()),
+            )
+        });
         if let Err(error) = valid {
             ui.colored_label(ERROR, error);
         }
-        let blocked = if self.connection.is_none() {
+        let inspected = self.inspection.available(&self.template);
+        let blocked = if !self.catalog_ready() {
+            "Scan the selected installation successfully before spawning."
+        } else if self.connection.is_none() {
             "Connect to the game first."
         } else if !self.can_spawn {
             "The game is not ready for item requests."
         } else if self.busy {
             "Wait for the current request to finish."
+        } else if !inspected {
+            self.inspection.reason()
         } else {
             "Correct the highlighted value first."
-        };
+        }
+        .to_owned();
         ui.horizontal(|ui| {
             ui.label("Quantity");
             number_input::number_input(ui, "quantity", &mut self.quantity, i32::MIN).on_hover_text(
@@ -488,10 +905,15 @@ impl Overlay {
             }
             let spawn =
                 egui::Button::new("Spawn pickup").min_size(egui::vec2(ui.available_width(), 30.0));
-            let enabled = self.can_spawn && !self.busy && valid.is_ok();
+            let enabled = self.connection.is_some()
+                && self.catalog_ready()
+                && self.can_spawn
+                && !self.busy
+                && inspected
+                && valid.is_ok();
             if ui
                 .add_enabled(enabled, spawn)
-                .on_hover_text("Creates equipment near your hero. Pick it up normally.")
+                .on_hover_text("Creates the selected pickup near your hero. Collect it normally.")
                 .on_disabled_hover_text(blocked)
                 .clicked()
             {
@@ -503,21 +925,16 @@ impl Overlay {
 }
 
 /// Toggle chips for one filter row; selecting several matches any of them.
-fn chips(
-    ui: &mut egui::Ui,
-    title: &str,
-    options: &[&'static str],
-    selected: &mut BTreeSet<&'static str>,
-) {
+fn chips(ui: &mut egui::Ui, title: &str, options: &[String], selected: &mut BTreeSet<String>) {
     ui.horizontal_wrapped(|ui| {
         ui.weak(title);
-        for &option in options {
+        for option in options {
             let on = selected.contains(option);
             if ui.selectable_label(on, option).clicked() {
                 if on {
                     selected.remove(option);
                 } else {
-                    selected.insert(option);
+                    selected.insert(option.clone());
                 }
             }
         }
@@ -553,4 +970,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(|cc| Ok(Box::new(Overlay::new(cc)))),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[test]
+    fn changed_installation_rejects_old_scan_results() {
+        let mut state = ScanState::default();
+        let (old, old_cancel) = state.begin();
+        let (new, _) = state.begin();
+        assert!(old_cancel.load(Ordering::Acquire));
+        assert!(!state.accepts(old));
+        assert!(state.accepts(new));
+    }
+
+    #[test]
+    fn cancelled_scan_cannot_publish_or_update_progress() {
+        let mut state = ScanState::default();
+        let (generation, cancel) = state.begin();
+        state.cancel();
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(!state.accepts(generation));
+        assert!(state.cancel.is_none());
+    }
+
+    #[test]
+    fn completion_summary_survives_and_stale_progress_cannot_replace_it() {
+        let mut state = ScanState::default();
+        let (old, _) = state.begin();
+        let (current, _) = state.begin();
+        state.record_progress(
+            current,
+            ScanProgress {
+                completed: 3,
+                total: 3,
+                message: "2 cached packages reused, 1 reparsed".into(),
+            },
+        );
+        state.record_progress(
+            old,
+            ScanProgress {
+                completed: 1,
+                total: 1,
+                message: "Wrong installation".into(),
+            },
+        );
+        assert_eq!(
+            state.summary.as_deref(),
+            Some("2 cached packages reused, 1 reparsed")
+        );
+        assert!(!state.progress.contains("Wrong installation"));
+    }
 }

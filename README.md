@@ -1,27 +1,43 @@
 # Dungeon Workshop
 
-A small Rust overlay and native adapter for experimenting with equipment in
+A small Rust overlay and native adapter for experimenting with items in
 Dungeon Defenders single-player.
 
-**Status: v0.2 single-player preview for Steam build 25809881.** Choose
-equipment and spawn it beside your hero, then pick it up normally. The weapon
-and armor spawn path was verified in a regular tavern, including user-confirmed
-pickup. The catalog contains 592 weapon/armor references; not every entry has
-been individually tested. Choose template defaults, a game-generated random roll,
-or custom quality and stat overrides. Custom weapon and armor values have been
-read back after normal pickup into the item box.
+**Status: development preview targeting Steam build 25887270, protocol v6.**
+Choose an item and spawn it beside your hero, then collect it normally. The item
+catalog is built automatically from your installed game packages. No item list
+is bundled. Categories are Weapons, Armor, Pets, Accessories, Collectibles,
+World Pickups, and Unclassified. Unknown candidates remain visible with an
+unavailable reason and cannot be spawned.
 
-![Dungeon Workshop window](docs/window.png)
+Duplicate equipment copies may have different cooked template IDs; those IDs do
+not cause a conflict by themselves. Other property or dependency differences
+remain blocked. Parent-forcing items show the parent template to select instead.
+
+The first scan runs in the background. Later launches reuse cached package
+metadata and reparse changed files. **Rebuild catalog** forces a fresh scan;
+**Cancel scan** preserves the previous cache. Metadata is stored under
+`%LOCALAPPDATA%\DungeonWorkshop\cache`, never in the game installation.
+
+Automatic discovery does not establish new engine behavior. Native integration
+still requires the verified executable and script packages, a standalone local
+session, and live inspection of each selection. See the
+[automatic catalog report](docs/automatic-catalog.md) for scanner coverage,
+cache behavior, current validation, and known limits. The
+[earlier item-family acceptance report](docs/item-menu-implementation.md)
+records the protocol-v5 representative collection and save/reload evidence.
 
 ## Run the preview
 
 1. Extract the complete portable ZIP into any writable folder.
 2. Start Dungeon Defenders and enter a regular **local single-player** map/tavern.
-3. Run `dd-overlay.exe` and click **Connect to game** in the top bar. The first
-   connection briefly pauses gameplay while inspecting reflection metadata.
-4. Search or filter the equipment list on the left, select an item, and choose
-   **Template defaults**, **Random roll**, or **Custom**. Choose quantity and click
-   **Spawn pickup**.
+3. Run `dd-overlay.exe` and wait for the package scan to finish, then click
+   **Connect to game**. The first connection validates script identities and
+   reflection metadata. Scanning itself does not attach to or modify the game.
+4. Search names or object paths, filter by category and family/slot, and select
+   an item. Wait for its running-game inspection. Equipment offers **Template
+   defaults**, **Random roll**, or **Custom**, where supported. Choose 1–10
+   pickups and click **Spawn pickup**.
 5. Pick it up in-game to equip or store it. Collected items appear in your item
    box. Normal game saves can retain picked-up items.
 
@@ -52,7 +68,7 @@ how many pickups were actually spawned, including partial results. Communication
 errors stop the search without retrying an uncertain spawn. A candidate taking
 over 8 ms stops the search; an individual game script call cannot be interrupted.
 
-In **Custom**, select a quality or keep **Template**, then check only the fields
+In equipment **Custom**, select a quality or keep **Template**, then check only the fields
 you want to override. Unchecked values remain inherited. Hero/defense bonuses,
 armor resistances, weapon bonuses and upgrade counts are supported. Weapon
 controls are **bonuses**, not final displayed totals; a weapon may not use every
@@ -70,6 +86,21 @@ tool limits, not normal loot caps. Small weapon bonuses are limited to −127–
 because larger values wrap in the game's serialization. The adapter also checks
 template minimum damage/upgrades and rejects a current level above the maximum.
 Leave both upgrade fields unchecked to preserve template defaults.
+
+Pets expose reviewed family-specific damage, healing, mana, guardian boost/range,
+attack rate, and projectile bonuses. Families without reviewed ability mappings
+offer common equipment controls only. Accessories expose resistances only when
+their templates support them. Changing category or capability profile clears
+incompatible settings; the adapter also rejects incompatible requests.
+
+Collectibles expose quantity, plus an optional stored value of 1–2,000,000,000
+for inventory mana tokens whose value initialization is verified. Pirate mana
+tokens currently expose defaults only. Collectibles have no equipment quality or combat controls.
+Collect and redeem them normally. World pickups expose packaged variants and
+quantity. Loose mana and fruit buffs have a separate actor-spawn route. Golden
+tokens require their mission controller; presents require delivery controllers.
+Flags remain unavailable because their team/base initialization is unverified.
+Physical spawning does not create mission progress or prove successful collection.
 
 Keep the three matching binaries together;
 restart the game before replacing an older attached adapter.
@@ -94,8 +125,11 @@ The game path is detected from common Steam libraries; it can also be entered
 manually. Detection checks PE architecture and the executable's SHA-256. A
 recognized executable is required for attachment. The adapter also checks live
 reflection layouts, game thread, standalone mode and local hero ownership before
-spawning. Other builds and ranked/online sessions are unsupported. Templates
-must already be loaded; reconnect after changing maps if a reference is missing.
+spawning. Other builds and ranked/online sessions are unsupported. Missing
+catalog assets can be loaded through the game loader from identity-checked,
+scanned source packages with matching content hashes and reviewed classes.
+References are refreshed after loading and map
+changes. Unresolved dependencies produce an explicit rejection.
 
 Closing the overlay disconnects its helper without closing the game. The adapter
 DLL stays loaded and idle until game exit, so restart the game before updating
@@ -152,6 +186,7 @@ stalled clients against the real DLL using `scripts/transport-test.ps1`.
 
 - `crates/overlay`: egui/eframe window, equipment search, game identification and
   helper lifecycle. Connections and requests run outside the UI thread.
+- `crates/catalog`: bounded package reader, preset class rules, and installation-specific metadata cache.
 - `crates/protocol`: concrete versioned messages and Windows named-pipe transport.
   Requests contain semantic item paths, quantities and typed item options, never
   game pointers.
@@ -166,7 +201,10 @@ later, and an ambiguous running operation is never retried automatically. There
 is one attachment per game process. The DLL is pinned to make disconnect safe.
 
 The pipe rejects remote clients, verifies the server PID on connection, limits
-frames to 16 KiB, and applies a two-second I/O deadline. One connection carries
+frames to 16 KiB, and applies a two-second framing deadline. A complete, valid
+v6 catalog-binding, inspection, or spawn request receives a 30-second response
+budget for catalog/source verification and package loading; incomplete
+or invalid requests do not extend the deadline. One connection carries
 one request and response. The protocol is deliberately small; it has no arbitrary
 command execution or memory-write operation.
 
@@ -175,12 +213,17 @@ command execution or memory-write operation.
 - Supports one local player on the verified Windows x86 game build.
 - Creates floor pickups with defaults, random rolls, or explicit custom overrides.
 - Custom mode starts from template defaults; it does not reroll before applying overrides.
-- No direct inventory insertion, package loading, pets or accessories.
-- Save/reload persistence and every catalog variant have not been tested.
+- No direct inventory insertion. Success means a verified floor actor, not an inventory grant.
+- Representative collection, pet/accessory equipping, custom values, and save/reload passed; redemption remains unverified.
+- Normal pickup stores coal separately; save/reload merged the three tested coal items into one stack.
+- Flags and mission pickups outside their required controllers remain blocked.
+- Runes lack concrete usable templates; costumes and crystal skins are unlock systems.
+- Catalog coverage does not imply that every variant works in every map.
 - After an uncertain response, inspect nearby pickups before trying again.
 
-See [runtime verification](docs/runtime-verification.md) for the checked bindings,
-live results and limits, and [the original investigation](docs/integration.md)
+See [current-build evidence](docs/current-build-validation.md),
+[catalog scanning](crates/catalog/README.md),
+[historical runtime verification](docs/runtime-verification.md), and [the original investigation](docs/integration.md)
 for the item-box route. No custom map or Total Conversion is required.
 
 This repository contains original tool code and equipment object-path references;
