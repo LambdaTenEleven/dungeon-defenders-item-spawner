@@ -1,6 +1,6 @@
 # Dungeon Workshop
 
-[![Rust checks](https://github.com/LambdaTenEleven/dungeon-defenders-item-spawner/actions/workflows/ci.yml/badge.svg)](https://github.com/LambdaTenEleven/dungeon-defenders-item-spawner/actions/workflows/ci.yml)
+[![Rust checks](https://github.com/LambdaTenEleven/dungeon-defenders-workshop/actions/workflows/ci.yml/badge.svg)](https://github.com/LambdaTenEleven/dungeon-defenders-workshop/actions/workflows/ci.yml)
 [![Rust 1.99.0](https://img.shields.io/badge/Rust-1.99.0-black?logo=rust)](rust-toolchain.toml)
 ![Windows 10/11 x64](https://img.shields.io/badge/Windows-10%2F11%20x64-0078D4)
 ![Development preview](https://img.shields.io/badge/status-development%20preview-orange)
@@ -13,7 +13,8 @@ single-player only.** Other game builds and ranked/online sessions are unsupport
 
 ## Get started
 
-1. Extract the complete portable ZIP into a writable folder. Keep
+1. Download the portable ZIP from [Releases](https://github.com/LambdaTenEleven/dungeon-defenders-workshop/releases)
+   and extract it into a writable folder. Keep
    `dd-overlay.exe`, `dd_adapter.dll`, and `dd-adapter-host.exe` together.
 2. Start Dungeon Defenders in windowed or borderless mode and enter a local
    single-player map or tavern.
@@ -95,6 +96,9 @@ The script runs formatting checks, Clippy, workspace tests, release builds, and
 32-bit adapter smoke/transport tests. It writes a portable ZIP and SHA-256 checksum
 to a new timestamped folder under `dist/`. Use `-OutputDirectory <fresh-folder>` to
 choose another location. The first build requires internet access.
+
+Pushing a version tag such as `0.1` runs the same CI checks and publishes the ZIP
+and checksum as a GitHub prerelease. Branch builds remain available as Actions artifacts.
 
 To check an extracted release:
 

@@ -1,5 +1,10 @@
 name: Rust checks
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: ['**']
+    tags: ['[0-9]*', 'v[0-9]*']
+  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -19,6 +24,40 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: DungeonWorkshop-preview-windows
+          if-no-files-found: error
           path: |
             dist/*.zip
             dist/*.sha256
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: DungeonWorkshop-preview-windows
+          path: dist
+      - name: Publish portable preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --check DungeonWorkshop-preview-windows.zip.sha256
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              DungeonWorkshop-preview-windows.zip \
+              DungeonWorkshop-preview-windows.zip.sha256 --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              DungeonWorkshop-preview-windows.zip \
+              DungeonWorkshop-preview-windows.zip.sha256 \
+              --verify-tag --prerelease \
+              --title "Dungeon Workshop $RELEASE_TAG" \
+              --notes "Development preview for Windows 10/11 x64 and Dungeon Defenders Steam build 25887270, local single-player only. Download and extract the ZIP, then run dd-overlay.exe. Keep all three binaries together."
+          fi

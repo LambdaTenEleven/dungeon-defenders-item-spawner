@@ -19,7 +19,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $targetRoot 'x86_64-pc-windows-msvc\release\dd-overlay.exe') -Destination $packageDirectory
     Copy-Item -LiteralPath (Join-Path $targetRoot 'i686-pc-windows-msvc\release\dd-adapter-host.exe') -Destination $packageDirectory
     Copy-Item -LiteralPath (Join-Path $targetRoot 'i686-pc-windows-msvc\release\dd_adapter.dll') -Destination $packageDirectory
-    Copy-Item -LiteralPath (Join-Path $repoRoot 'README.md'),(Join-Path $repoRoot 'LICENSE') -Destination $packageDirectory
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'README.md'),(Join-Path $repoRoot 'LICENSE'),(Join-Path $repoRoot 'rust-toolchain.toml') -Destination $packageDirectory
     $docsDirectory = Join-Path $packageDirectory 'docs'
     New-Item -ItemType Directory -Path $docsDirectory | Out-Null
     Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\integration.md') -Destination $docsDirectory
@@ -33,7 +33,6 @@ try {
     New-Item -ItemType Directory -Path $catalogDocs -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $repoRoot 'crates\catalog\README.md') -Destination $catalogDocs
     Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\automatic-catalog.md') -Destination $docsDirectory
-    Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\reroll-benchmark.md') -Destination $docsDirectory
 
     $testLog = Join-Path $OutputDirectory 'adapter-smoke.stdout.log'
     $errorLog = Join-Path $OutputDirectory 'adapter-smoke.stderr.log'
@@ -52,6 +51,6 @@ try {
     if (Test-Path -LiteralPath $archive) { throw "Archive already exists: $archive" }
     Compress-Archive -LiteralPath $packageDirectory -DestinationPath $archive
     $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-    "$hash  $([IO.Path]::GetFileName($archive))" | Set-Content -LiteralPath ($archive + '.sha256') -Encoding ascii
+    [IO.File]::WriteAllText(($archive + '.sha256'), "$hash  $([IO.Path]::GetFileName($archive))`n", [Text.Encoding]::ASCII)
     Write-Output $archive
 } finally { Pop-Location }
