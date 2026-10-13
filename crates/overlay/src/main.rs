@@ -8,6 +8,7 @@ mod game;
 mod inspection;
 mod number_input;
 mod search;
+mod settings;
 
 use catalog::{Filter, Kind, Template};
 use connection::GameConnection;
@@ -65,6 +66,8 @@ struct Overlay {
     template: String,
     quantity: i32,
     editor: editor::ItemEditor,
+    search_limits: settings::SearchLimits,
+    settings_notice: String,
     inspection: inspection::InspectionState,
     install_path: String,
     game_status: String,
@@ -139,6 +142,14 @@ impl Overlay {
         let templates = Vec::new();
         let template = String::new();
         let filter = Filter::default();
+        let (search_limits, settings_notice) =
+            match settings::path().and_then(|path| settings::SearchLimits::load(&path)) {
+                Ok(limits) => (limits, String::new()),
+                Err(error) => (
+                    settings::SearchLimits::default(),
+                    format!("Search settings could not be loaded; using defaults. {error}"),
+                ),
+            };
         let mut app = Self {
             catalog: None,
             catalog_path: String::new(),
@@ -150,6 +161,8 @@ impl Overlay {
             template,
             quantity: 1,
             editor: editor::ItemEditor::default(),
+            search_limits,
+            settings_notice,
             inspection: inspection::InspectionState::default(),
             install_path: game::find_installation()
                 .map(|p| p.display().to_string())
@@ -356,6 +369,10 @@ impl Overlay {
         {
             return;
         }
+        if options.needs_search() && self.search_limits.validate().is_err() {
+            return;
+        }
+        let limits = self.search_limits;
         let pid = connection.pid;
         let command = Command::Spawn {
             catalog: connection.catalog.clone(),
@@ -374,7 +391,7 @@ impl Overlay {
         }
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result = search::run(pid, command, &cancel, |message| {
+            let result = search::run(pid, command, limits, &cancel, |message| {
                 let _ = tx.send(Event::Progress(message));
                 context.request_repaint();
             });
@@ -651,7 +668,56 @@ impl Overlay {
         ui.add_space(4.0);
     }
 
+    fn search_settings(&mut self, ui: &mut egui::Ui) {
+        let before = self.search_limits;
+        let mut reset = false;
+        ui.label("Search limits");
+        ui.add_enabled_ui(!self.busy, |ui| {
+            egui::Grid::new("search-limits")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Maximum roll attempts (1-10,000)");
+                    number_input::number_input(
+                        ui,
+                        "roll-attempts",
+                        &mut self.search_limits.attempts,
+                        0,
+                    );
+                    ui.end_row();
+                    ui.label("Time limit in seconds (1-300)");
+                    number_input::number_input(
+                        ui,
+                        "roll-seconds",
+                        &mut self.search_limits.seconds,
+                        0,
+                    );
+                    ui.end_row();
+                });
+            if ui.button("Reset search limits").clicked() {
+                self.search_limits = Default::default();
+                reset = true;
+            }
+        });
+        ui.small("Applies to the whole search, including multiple pickups. Stops at either limit; a roll already running finishes first. Saved for all item categories.");
+        if let Err(error) = self.search_limits.validate() {
+            ui.colored_label(ERROR, error);
+        } else if reset || before != self.search_limits {
+            self.settings_notice =
+                match settings::path().and_then(|path| self.search_limits.save(&path)) {
+                    Ok(()) => String::new(),
+                    Err(error) => format!(
+                        "Search limits apply for this session but could not be saved. {error}"
+                    ),
+                };
+        }
+        if !self.settings_notice.is_empty() {
+            ui.colored_label(WARNING, &self.settings_notice);
+        }
+    }
+
     fn settings(&mut self, ui: &mut egui::Ui) {
+        self.search_settings(ui);
+        ui.separator();
         ui.label("Game installation");
         ui.horizontal(|ui| {
             let width = ui.available_width() - 86.0;
@@ -856,6 +922,16 @@ impl Overlay {
             ui.add_space(6.0);
             if options_available {
                 self.editor.show(ui, kind, caps);
+                if self.editor.options(kind, caps).needs_search() {
+                    if self.show_settings {
+                        ui.small(format!(
+                            "Search limits: {} attempts / {} seconds (edit in Settings).",
+                            self.search_limits.attempts, self.search_limits.seconds
+                        ));
+                    } else {
+                        self.search_settings(ui);
+                    }
+                }
             }
         }
     }
@@ -870,10 +946,12 @@ impl Overlay {
             let item = self
                 .current()
                 .ok_or("Select an item from the shared catalog.")?;
-            validate_item_options(
-                &item.entry,
-                &self.editor.options(item.kind, self.capabilities().unwrap()),
-            )
+            let options = self.editor.options(item.kind, self.capabilities().unwrap());
+            validate_item_options(&item.entry, &options)?;
+            if options.needs_search() {
+                self.search_limits.validate()?;
+            }
+            Ok(())
         });
         if let Err(error) = valid {
             ui.colored_label(ERROR, error);

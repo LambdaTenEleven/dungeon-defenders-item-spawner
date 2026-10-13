@@ -6,6 +6,7 @@ use dd_protocol::{
     validate_item_options,
 };
 
+mod dependencies;
 mod equipment;
 mod layout;
 mod tavern;
@@ -62,6 +63,7 @@ struct Engine {
     world: Option<u32>,
     load_failures: HashMap<String, String>,
     catalog: Option<Arc<dd_catalog::CatalogSnapshot>>,
+    dependencies: Option<Arc<dd_catalog::dependencies::Dependencies>>,
 }
 
 struct Session {
@@ -211,6 +213,7 @@ impl Engine {
             world: None,
             load_failures: HashMap::new(),
             catalog: None,
+            dependencies: None,
         };
         engine.check_thread()?;
         engine.refresh_references()?;
@@ -697,6 +700,7 @@ impl Engine {
                 self.value(template, "UDKGame.HeroEquipment.EquipmentWeaponTemplate")? != 0,
                 "Weapon archetype has no weapon template.",
             )?;
+            dependencies::validate(self, entry, template)?;
         }
         let drops = array(
             self.field_address(template, "UDKGame.HeroEquipment.DroppedEquipmentTemplates")?,
@@ -999,10 +1003,7 @@ pub fn initialize() -> Result<()> {
     }
 }
 
-pub fn handle(
-    request: Request,
-    prepared_catalog: Option<Arc<dd_catalog::CatalogSnapshot>>,
-) -> Response {
+pub fn handle(request: Request, prepared: crate::catalog_runtime::Prepared) -> Response {
     let mut failed_spawn = None;
     let result: Result<AdapterStatus> = (|| {
         require(
@@ -1017,6 +1018,7 @@ pub fn handle(
             .ok_or("Game adapter has not initialized.")?
             .as_mut()
             .map_err(|error| error.clone())?;
+        engine.dependencies = prepared.dependencies;
         let ready = engine.refresh_session();
         let mut status = AdapterStatus {
             pid: std::process::id(),
@@ -1038,8 +1040,9 @@ pub fn handle(
             }
             Command::BindCatalog { catalog } => {
                 ready?;
-                let prepared =
-                    prepared_catalog.ok_or("Catalog was not prepared by the adapter worker.")?;
+                let prepared = prepared
+                    .catalog
+                    .ok_or("Catalog was not prepared by the adapter worker.")?;
                 require(
                     prepared.key == catalog,
                     "Prepared catalog identity differs.",

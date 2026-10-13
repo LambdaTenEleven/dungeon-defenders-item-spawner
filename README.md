@@ -12,7 +12,9 @@ unavailable reason and cannot be spawned.
 
 Duplicate equipment copies may have different cooked template IDs; those IDs do
 not cause a conflict by themselves. Other property or dependency differences
-remain blocked. Parent-forcing items show the parent template to select instead.
+remain blocked when they share the same runtime path. Package-local variants
+retain their source package identity, including the two Fenghuang templates.
+Parent-forcing items show the parent template to select instead.
 
 The first scan runs in the background. Later launches reuse cached package
 metadata and reparse changed files. **Rebuild catalog** forces a fresh scan;
@@ -60,13 +62,21 @@ It changes only newly created temporary equipment, never live game difficulty or
 shared templates. **Any** quality also works with Tavern testing; multiple items
 are paced one at a time. Unreachable tiers can still exhaust the search limit.
 
-Searches stop after 200 candidates or 15 seconds across the requested quantity.
-The app waits at least 50 ms between single-candidate game-thread requests;
+**Maximum roll attempts** (1–10,000) and **Time limit in seconds** (1–300) are
+available beside random-roll options and in Settings. Defaults remain 200 attempts
+and 15 seconds. Both limits apply across the whole requested quantity; whichever
+is reached first stops further attempts. Valid changes are saved automatically to
+`%LOCALAPPDATA%\DungeonWorkshop\search-settings.json` and survive item/category
+changes and app restarts. Invalid values disable searches without overwriting the
+last saved values. **Reset search limits** restores the defaults.
+
+The app waits at least 10 ms between single-candidate game-thread requests;
 rejected candidates never become floor pickups. **Cancel search** stops further
 attempts after the current request finishes. Progress and the final message report
 how many pickups were actually spawned, including partial results. Communication
 errors stop the search without retrying an uncertain spawn. A candidate taking
 over 8 ms stops the search; an individual game script call cannot be interrupted.
+See [the pacing benchmark](docs/reroll-benchmark.md) for measured speed and limitations.
 
 In equipment **Custom**, select a quality or keep **Template**, then check only the fields
 you want to override. Unchecked values remain inherited. Hero/defense bonuses,

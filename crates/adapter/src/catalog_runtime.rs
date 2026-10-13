@@ -44,6 +44,19 @@ pub(crate) struct CatalogState {
     bound: Option<Arc<CatalogSnapshot>>,
     verified: HashMap<PathBuf, (u64, SystemTime, String)>,
     exports: HashMap<(String, String), dd_catalog::ExportRecord>,
+    dependencies: HashMap<
+        (String, String),
+        (
+            Arc<dd_catalog::dependencies::Dependencies>,
+            Vec<PackageSource>,
+        ),
+    >,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct Prepared {
+    pub catalog: Option<Arc<CatalogSnapshot>>,
+    pub dependencies: Option<Arc<dd_catalog::dependencies::Dependencies>>,
 }
 
 pub(crate) fn source_path(installation: &Path, relative: &str) -> Result<PathBuf, String> {
@@ -128,10 +141,140 @@ fn verify_export(
 }
 
 impl CatalogState {
-    pub(crate) fn commit(&mut self, snapshot: Option<Arc<CatalogSnapshot>>) {
-        if let Some(snapshot) = snapshot {
+    pub(crate) fn commit(&mut self, prepared: Prepared) {
+        if let Some(snapshot) = prepared.catalog {
             self.bound = Some(snapshot);
         }
+    }
+
+    fn prepare_dependencies(
+        &mut self,
+        snapshot: &CatalogSnapshot,
+        source: &PackageSource,
+        template: &str,
+    ) -> Result<Arc<dd_catalog::dependencies::Dependencies>, String> {
+        let graph = self.prepare_source_dependencies(snapshot, source, template)?;
+        for path in &snapshot
+            .find(template)
+            .ok_or("Unknown dependency template")?
+            .source_packages
+        {
+            if path == &source.path {
+                continue;
+            }
+            let alternate = snapshot
+                .source(path)
+                .ok_or("Dependency source has no provenance")?;
+            let other = self.prepare_source_dependencies(snapshot, alternate, template)?;
+            if graph != other {
+                return Err(format!(
+                    "Conflicting package dependency definitions for {template}: {} and {path}",
+                    source.path
+                ));
+            }
+        }
+        Ok(graph)
+    }
+
+    fn prepare_source_dependencies(
+        &mut self,
+        snapshot: &CatalogSnapshot,
+        source: &PackageSource,
+        template: &str,
+    ) -> Result<Arc<dd_catalog::dependencies::Dependencies>, String> {
+        let key = (
+            format!(
+                "{}:{}:{}",
+                snapshot.key.generation, source.path, source.sha256
+            ),
+            template.to_owned(),
+        );
+        let installation = Path::new(&snapshot.installation);
+        if let Some((graph, sources)) = self.dependencies.get(&key).cloned() {
+            for source in &sources {
+                self.verify_file(installation, source)?;
+            }
+            return Ok(graph);
+        }
+        let mut packages = Vec::<(PackageSource, dd_catalog::package::Package)>::new();
+        let mut records = HashMap::<(String, bool), dd_catalog::ExportRecord>::new();
+        let graph = dd_catalog::dependencies::build(template, |path, properties| {
+            let key = (path.to_ascii_lowercase(), properties);
+            if let Some(record) = records.get(&key) {
+                return Ok(record.clone());
+            }
+            if records.len() >= 512 {
+                return Err("Dependency source resolution limit exceeded.".into());
+            }
+            let root = path.split('.').next().ok_or("Invalid dependency path")?;
+            let mut sources = vec![source.clone()];
+            // Prefer the selected cooked definition. External logical packages may
+            // be in their own file or in the reviewed English/script packages.
+            sources.extend(
+                snapshot
+                    .packages
+                    .iter()
+                    .filter(|s| {
+                        Path::new(&s.path)
+                            .file_stem()
+                            .is_some_and(|stem| stem.eq_ignore_ascii_case(root))
+                    })
+                    .cloned(),
+            );
+            for fallback in [
+                "UDKGame/CookedPCConsole/Startup_INT.upk",
+                "UDKGame/CookedPCConsole/UDKGame.upk",
+            ] {
+                if let Some(s) = snapshot.source(fallback) {
+                    sources.push(s.clone());
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            for source in sources {
+                if !seen.insert(source.path.clone()) {
+                    continue;
+                }
+                let index = if let Some(index) =
+                    packages.iter().position(|(s, _)| s.path == source.path)
+                {
+                    index
+                } else {
+                    if packages.len() >= 16 {
+                        return Err("Dependency package resolution limit exceeded.".into());
+                    }
+                    self.verify_file(installation, &source)?;
+                    let file = source_path(installation, &source.path)?;
+                    packages.push((source, dd_catalog::package::Package::open_streamed(&file)?));
+                    packages.len() - 1
+                };
+                let package = &mut packages[index].1;
+                let result = if properties {
+                    package.inspect_export(path)
+                } else {
+                    package.inspect_identity(path)
+                };
+                match result {
+                    Ok(record) => {
+                        records.insert(key, record.clone());
+                        return Ok(record);
+                    }
+                    Err(error)
+                        if error == "Selected export was not found in its source package" => {}
+                    Err(error) => return Err(format!("Dependency {path}: {error}")),
+                }
+            }
+            Err(format!("Unresolved dependency export: {path}"))
+        })?;
+        let sources: Vec<_> = packages.into_iter().map(|(source, _)| source).collect();
+        for source in &sources {
+            self.verify_file(installation, source)?;
+        }
+        let graph = Arc::new(graph);
+        if self.dependencies.len() >= 128 {
+            self.dependencies.clear();
+        }
+        self.dependencies.insert(key, (Arc::clone(&graph), sources));
+        Ok(graph)
     }
 
     fn verify_file(&mut self, installation: &Path, source: &PackageSource) -> Result<(), String> {
@@ -166,12 +309,9 @@ impl CatalogState {
         Ok(())
     }
 
-    pub(crate) fn prepare(
-        &mut self,
-        request: &Request,
-    ) -> Result<Option<Arc<CatalogSnapshot>>, String> {
+    pub(crate) fn prepare(&mut self, request: &Request) -> Result<Prepared, String> {
         if request.version != VERSION {
-            return Ok(None);
+            return Ok(Prepared::default());
         }
         match &request.command {
             Command::BindCatalog { catalog } => {
@@ -213,7 +353,10 @@ impl CatalogState {
                     }
                     self.verify_file(&installation, source)?;
                 }
-                Ok(Some(Arc::new(snapshot)))
+                Ok(Prepared {
+                    catalog: Some(Arc::new(snapshot)),
+                    dependencies: None,
+                })
             }
             Command::InspectItem { catalog, template }
             | Command::Spawn {
@@ -244,9 +387,19 @@ impl CatalogState {
                     }
                     verify_export(entry, &self.exports[&key])?;
                 }
-                Ok(None)
+                let dependencies = if entry.unavailable_reason.is_none()
+                    && entry.kind == dd_catalog::ItemKind::Weapon
+                {
+                    Some(self.prepare_dependencies(&snapshot, &source, template)?)
+                } else {
+                    None
+                };
+                Ok(Prepared {
+                    catalog: None,
+                    dependencies,
+                })
             }
-            _ => Ok(None),
+            _ => Ok(Prepared::default()),
         }
     }
 }
@@ -254,6 +407,52 @@ impl CatalogState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "Requires a locally scanned game catalog; never bundles game assets"]
+    fn installed_weapon_dependencies() {
+        let path = std::env::var("DD_DEPENDENCY_CATALOG").expect("Set DD_DEPENDENCY_CATALOG");
+        let snapshot: CatalogSnapshot = serde_json::from_reader(File::open(path).unwrap()).unwrap();
+        let filter = std::env::var("DD_DEPENDENCY_FILTER").unwrap_or_default();
+        let mut state = CatalogState::default();
+        let mut passed = 0;
+        let mut blocked = std::collections::BTreeSet::new();
+        let expected: std::collections::BTreeSet<_> = std::env::var("DD_DEPENDENCY_EXPECT_BLOCKED")
+            .unwrap_or_default()
+            .split(';')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect();
+        for entry in snapshot.entries.iter().filter(|entry| {
+            entry.kind == dd_catalog::ItemKind::Weapon
+                && entry.unavailable_reason.is_none()
+                && entry.path.contains(&filter)
+        }) {
+            let source = preferred_source(&snapshot, &entry.path).unwrap();
+            match state.prepare_dependencies(&snapshot, &source, &entry.path) {
+                Ok(graph) => {
+                    passed += 1;
+                    println!(
+                        "PASS {}: {} dependency objects",
+                        entry.path,
+                        graph.nodes.len()
+                    );
+                }
+                Err(error) => {
+                    blocked.insert(entry.path.clone());
+                    println!("BLOCKED {}: {error}", entry.path);
+                }
+            }
+        }
+        println!(
+            "Dependency scan: {passed} passed, {} blocked",
+            blocked.len()
+        );
+        assert!(passed + blocked.len() > 0);
+        assert_eq!(
+            blocked, expected,
+            "Investigate unexpected blocked dependencies; do not bypass them"
+        );
+    }
     #[test]
     fn another_generation_cannot_authorize_a_request() {
         let key = CatalogKey {

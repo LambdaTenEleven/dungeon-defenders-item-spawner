@@ -212,7 +212,7 @@ impl ItemEditor {
                         .text("Roll strength")
                         .fixed_decimals(2),
                 );
-                ui.label("A selected quality searches natural rolls for up to 200 attempts or 15 seconds. Some templates cannot roll every tier.");
+                ui.label("A selected quality searches natural rolls until a match or a search limit. Some templates cannot roll every tier.");
                 if self.conditions == dd_protocol::LootConditions::TavernTesting {
                     ui.small("Fixed high-level conditions, independent of map and difficulty. Your game settings stay unchanged.");
                 }

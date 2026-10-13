@@ -33,6 +33,7 @@ try {
     New-Item -ItemType Directory -Path $catalogDocs -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $repoRoot 'crates\catalog\README.md') -Destination $catalogDocs
     Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\automatic-catalog.md') -Destination $docsDirectory
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\reroll-benchmark.md') -Destination $docsDirectory
 
     $testLog = Join-Path $OutputDirectory 'adapter-smoke.stdout.log'
     $errorLog = Join-Path $OutputDirectory 'adapter-smoke.stderr.log'

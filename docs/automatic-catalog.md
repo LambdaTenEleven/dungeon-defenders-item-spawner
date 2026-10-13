@@ -1,6 +1,6 @@
 # Automatic catalog implementation and verification
 
-Updated 2026-10-12. Protocol **v6** replaces the bundled item catalog with automatic
+Updated 2026-10-13. Protocol **v6** replaces the bundled item catalog with automatic
 package discovery, caching, and preset rules. Native integration still targets
 Steam build **25887270**.
 
@@ -38,7 +38,150 @@ five localized startup packages containing reviewed scripts. This is separate
 from the discovered item list. Changed integration scripts require validation;
 scanning does not imply compatibility with arbitrary updates or mod behavior.
 
-## Installed-file comparison and timing
+## Shared weapon dependency validation (scanner v3)
+
+The item-specific `fenghuang.rs` validator has been removed. `dd-catalog` now
+defines bounded relationships for equipment, weapons, mesh components, projectiles,
+emitters, particle components, and asset leaves. Every weapon follows this shared
+profile; no item name or map-specific dependency object name appears in production
+validation rules. Actual paths and concrete classes come from source exports.
+
+The IPC worker reads inherited object/component references from source-verified
+packages. It starts with the selected cooked source, then permits an external
+dependency's named installed package and reviewed English/script packages. Missing
+definitions remain errors. It compares the resolved chains across every source
+copy of the selected equipment and rejects disagreement. Work is bounded to 64
+graph nodes/inheritance steps, 512 source records, and 16 package readers. Asset
+leaves use export-table identities without interpreting opaque asset payloads.
+Prepared graphs are cached by catalog generation, source path/hash, and item path;
+the worker rechecks contributing package provenance on reuse.
+
+Only the game thread inspects native objects. Each request receives its own prepared
+graph; no graph is transmitted over the pipe or trusted from the UI. Loaded objects
+must match source paths and exact classes, with live object-table membership,
+verified reflected property types/targets, and component ownership. Crossbow and
+MagicStaff descendants require a projectile through runtime class ancestry.
+Optional null references must also be null at runtime. Existing package loading,
+map-change reference refresh, session ownership, saveability, and spawn-outcome
+checks remain unchanged. This is a bounded weapon-reference validator, not a
+recursive verifier of every game asset or an authorization of arbitrary scripts.
+
+Scanner v3 rebuilds cached facts because component properties are now decoded.
+The fresh 178-package scan still contains 1,257 entries and 156 catalog-level
+exclusions, with zero package issues. Dependency failures additionally block a
+selected item during inspection, even when its catalog classification is known.
+
+The initial installed-weapon audit resolved 566 candidates and conservatively
+blocked two Assault Pack variants with an empty particle effect. Investigation
+confirmed an explicit serialized null overriding the parent's particle asset,
+matching a null live pointer and empty alternate-template array. The shipped
+`DunDefEmitterSpawnable.PostBeginPlay` explicitly handles this with a failsafe
+lifespan (1,340 byte function, SHA-256
+`b0d9977e01d2bd6b82128bdce6f3c20be796ba44a7d4c303236997170ff01ada`).
+The shared rule therefore permits this optional null leaf, while a nonnull source
+reference still requires the exact live asset. Missing inheritance or a missing
+nonnull export is never treated as null. This avoids an unnecessary item-specific
+exception or blocking a supported empty effect.
+
+The follow-up audit passed all six Assault Pack weapon variants, including both
+formerly blocked cases. Together with the full initial audit this resolves all
+568 catalog-admitted weapon candidates through the bounded source profile. This
+is dependency coverage, not 568 live spawn tests. The final packaged adapter also
+passed live inspection of both empty-effect weapons after the game restart.
+
+Live validation passed for both Fenghuang variants and basic crossbow, staff,
+spear, and sword templates in the local tavern. The generic validator spawned a
+new pickup of each Fenghuang variant; independent readback confirmed the actors,
+fresh IDs, and correct original package archetypes. Normal collection increased
+the item box from 134 to 136 with all sampled values preserved. After normal exit
+and a full restart, both were still inventory-owned with identical IDs, archetypes,
+stats, resistances, and upgrades. The game restored their dependency chains before
+any adapter was attached in the new process.
+The final packaged adapter then revalidated both saved variants and the four basic
+weapon families in that process.
+
+| Variant | New equipment IDs | Generic-validator lifecycle result |
+| --- | --- | --- |
+| `EmeraldCity.01Phoenix` | `1505065856 / 399719232` | Spawn, collection, and full restart verified |
+| `EmeraldCity_Small.01Phoenix` | `137573248 / 553344704` | Spawn, collection, and full restart verified |
+
+Synthetic tests cover arbitrary package names, optional nulls, inherited references
+and overrides, missing/malformed references, unknown mesh classes, source-class
+and reference conflicts, cycles, and component prefixes/bounds. Local evidence
+is retained under `target/generic-dependencies` and
+`target/item-implementation/lifecycle-generic-*` and is excluded from Git.
+
+Formatting, workspace and i686 adapter Clippy with warnings denied, and all
+**114 workspace tests** pass. The installed-package dependency audit is an explicit
+opt-in test, separate from synthetic CI fixtures. The packaged real 32-bit DLL
+smoke and transport suites also pass. Combat behavior and every random/custom
+combination remain outside this verification.
+
+## Package-root identity correction (scanner v2, rules v3)
+
+The item-specific dependency checks described in this earlier verification were
+subsequently replaced by the shared validator above.
+
+The old reader omitted the source package from ordinary root exports. This made
+distinct map-owned objects appear to share one runtime path, and also affected
+nested references. The reader now uses the export table's `ForcedExport` bit:
+ordinary roots belong to the source package; forced roots retain their cooked
+logical identity; imports retain the external package identity. Classification
+uses those resolved paths directly. Scanner v2 invalidates previous package facts;
+rules v3 and a new catalog generation keep the overlay and adapter in agreement.
+
+The installed-file rescan reads all 178 packages without issues and discovers
+**1,257 distinct entries**: 576 weapons, 66 armor, 327 pets, 221 accessories,
+47 collectibles, and 20 world pickups. **156 remain unavailable**. The increase
+reflects previously conflated map-local variants, chiefly parent-forcing pets;
+it does not establish universal spawn support. The old and new catalogs agree
+on availability for every unchanged path. The game-visible cold rebuild took
+22.96 seconds, and persisted-cache reload matched the generated snapshot.
+
+Fenghuang now has two entries, `EmeraldCity.01Phoenix` and
+`EmeraldCity_Small.01Phoenix`. Their distinct weapon dependencies remain distinct;
+no dependency differences are discarded. The adapter checks each variant's live
+weapon, projectile, collision component, skeletal mesh, both emitter templates,
+and particle assets before creating equipment. It verifies reflected field types
+and targets, exact variant object/class identities, component ownership, and live
+object references. A failed dependency check prevents creation and is reported
+as an unavailable reason by selected-item inspection. The ordinary saveability,
+archetype, session, fresh-ID, and dropped-actor checks also remain in force.
+
+Both variants passed these checks in a local single-player tavern on build
+25887270. Each produced one independently observed floor actor, with its original
+package archetype and a distinct fresh ID pair. Normal collection increased the
+item box from 132 to 134; both exact IDs and all sampled stats, resistances, and
+upgrade values matched the floor snapshot. Unqualified `01Phoenix` and fabricated
+package paths were rejected. After a normal exit and full process restart, both
+items remained inventory-owned with the same IDs, class, original archetype,
+stats, resistances, and upgrade values. This readback happened before attaching
+any adapter in the new process. The game independently restored both map packages
+and the weapon/projectile/component/effect chains from the saved item references.
+
+| Variant | Fresh equipment IDs | Spawn, collection, full restart |
+| --- | --- | --- |
+| `EmeraldCity.01Phoenix` | `1872436480 / 1872741760` | Verified; all sampled values retained |
+| `EmeraldCity_Small.01Phoenix` | `997314432 / 1484008832` | Verified; all sampled values retained |
+
+This verifies template-default spawning, storage, and reload in the local tavern.
+It does not establish combat behavior or test every random/custom combination.
+
+The authored templates contain out-of-range small weapon bonuses (shots per second
+8000 and charge speed 500). Normal game serialization produces 64 and -12 on the
+created items. Template-default mode retains this engine behavior; it does not
+promise the raw authored numbers survive serialization. Custom controls continue
+to enforce the reviewed serialization bounds.
+
+Validation passed: formatting, workspace and i686 adapter Clippy with all targets
+and warnings denied, **108 workspace tests**, packaged 32-bit DLL smoke, and
+fragmented/oversized/timeout/version-mismatch transport checks. Regression coverage
+includes source-owned roots and children, forced cooked roots, external imports,
+separate package-local dependency identities, and genuinely conflicting same-path
+definitions. Local live evidence is under `target/fenghuang` and
+`target/item-implementation/lifecycle-fenghuang-*`; game-derived data stays ignored.
+
+## Initial installed-file comparison and timing (scanner v1)
 
 The Rust scanner read all **178 packages**, totaling **9,700,476,197 bytes**, with
 zero package issues. It retains all previous **1,184 equipment candidates** with
@@ -57,7 +200,10 @@ Pirate Mana Token defaults remain available, but its custom stored-value option
 is removed because its properties do not establish the reviewed high-digit
 initialization. Radioactive coal's high-digit flag alone is insufficient.
 
-## Template-ID conflict fix (rules v2)
+## Earlier template-ID conflict fix (rules v2)
+
+This section records the earlier investigation. The scanner-v2 correction and
+Fenghuang validation above supersede its unresolved package-root conclusion.
 
 The five reported conflicts were investigated in the installed build's package
 metadata, shipped scripts, and current-process reflection/native save routine.

@@ -223,15 +223,6 @@ pub fn capabilities(kind: ItemKind, class: &str, props: &Properties) -> ItemCapa
     result
 }
 
-fn canonical(package: &str, path: &str) -> String {
-    if path.contains('.') {
-        return path.to_owned();
-    }
-    let leaf = package.rsplit(['/', '\\']).next().unwrap_or(package);
-    let stem = leaf.rsplit_once('.').map_or(leaf, |(stem, _)| stem);
-    format!("{stem}.{path}")
-}
-
 #[derive(Clone, Copy)]
 struct Record<'a> {
     package: &'a str,
@@ -344,7 +335,6 @@ impl Resolver<'_> {
             props.extend(self.resolve_group(defaults, row.package, seen)?);
         }
         if let Some(parent) = record.archetype.as_deref() {
-            let parent = canonical(row.package, parent);
             if let Some(parents) = self.records.get(&parent.to_ascii_lowercase()) {
                 props.extend(self.resolve_group(parents, row.package, seen)?);
             } else if parent != "UDKGame.Default__HeroEquipmentNative"
@@ -492,7 +482,7 @@ fn definition_difference(
         row.export
             .archetype
             .as_deref()
-            .map(|path| canonical(row.package, path).to_ascii_lowercase())
+            .map(|path| path.to_ascii_lowercase())
     };
     if archetype(left) != archetype(right) {
         return Some("archetype reference".into());
@@ -609,7 +599,7 @@ fn describe(row: Record<'_>, graph: &Graph, props: &Properties) -> CatalogEntry 
     let forced_parent_reason = record.archetype.as_deref().map(|parent| {
         format!(
             "This template forces its parent; choose {} instead.",
-            canonical(row.package, parent)
+            parent.to_owned()
         )
     });
     let reason = if !record.path.contains('.') {
@@ -709,7 +699,7 @@ pub fn classify(packages: &[PackageFacts]) -> Vec<CatalogEntry> {
             };
             resolver
                 .records
-                .entry(canonical(row.package, &export.path).to_ascii_lowercase())
+                .entry(export.path.to_ascii_lowercase())
                 .or_default()
                 .push(row);
             if export.is_class_default {
@@ -931,6 +921,36 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .contains("Conflicting")
+        );
+    }
+
+    #[test]
+    fn package_local_variants_keep_distinct_dependencies() {
+        let variants: Vec<_> = ["EmeraldCity", "EmeraldCity_Small"]
+            .into_iter()
+            .map(|root| {
+                let mut source = package(vec![export(
+                    &format!("{root}.01Phoenix"),
+                    EQUIPMENT,
+                    json!({"EquipmentWeaponTemplate":format!("{root}.Weapon")}),
+                )]);
+                source.source.path = format!("UDKGame/CookedPCConsole/{root}.upk");
+                source
+            })
+            .collect();
+        let entries = classify(&variants);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.unavailable_reason.is_none() && entry.source_packages.len() == 1));
+        let mut incompatible = variants[1].clone();
+        incompatible.exports[1].path = variants[0].exports[1].path.clone();
+        let entries = classify(&[variants[0].clone(), incompatible]);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .unavailable_reason
+                .as_ref()
+                .unwrap()
+                .contains("EquipmentWeaponTemplate")
         );
     }
 

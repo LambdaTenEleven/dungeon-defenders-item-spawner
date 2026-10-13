@@ -29,6 +29,7 @@ struct Object {
     parent: i32,
     archetype: i32,
     flags: u64,
+    export_flags: u32,
     offset: usize,
     size: usize,
 }
@@ -254,6 +255,7 @@ impl Package {
                 parent: 0,
                 archetype: 0,
                 flags: 0,
+                export_flags: 0,
                 offset: 0,
                 size: 0,
             });
@@ -281,6 +283,7 @@ impl Package {
                 archetype: i32_at(&table, position + 20)?,
                 flags: u64::from(u32_at(&table, position + 24)?)
                     | (u64::from(u32_at(&table, position + 28)?) << 32),
+                export_flags: u32_at(&table, position + 40)?,
                 offset,
                 size,
             });
@@ -290,14 +293,6 @@ impl Package {
             return Err("Export table end does not match dependency table".into());
         }
         Ok(package)
-    }
-
-    fn canonical(&self, path: String) -> String {
-        if path.contains('.') {
-            path
-        } else {
-            format!("{}.{}", self.stem, path)
-        }
     }
 
     fn resolve(&mut self, index: i32, depth: usize) -> Result<Option<String>, String> {
@@ -318,8 +313,13 @@ impl Package {
         .ok_or("Object index outside package tables")?;
         let name = object.name.clone();
         let outer = object.outer;
+        // Ordinary root exports belong to this file's package. Forced exports
+        // retain their logical package root when cooked into another file. Imports
+        // name external roots and must never acquire the source filename prefix.
+        let local_root = index > 0 && object.export_flags & 1 == 0;
         let result = match self.resolve(outer, depth + 1)? {
             Some(parent) => format!("{parent}.{name}"),
+            None if local_root => format!("{}.{}", self.stem, name),
             None => name,
         };
         if result.len() > 8192 {
@@ -338,13 +338,8 @@ impl Package {
             let path = self
                 .resolve(index as i32 + 1, 0)?
                 .ok_or("Class path missing")?;
-            let parent = self
-                .resolve(self.exports[index].parent, 0)?
-                .map(|path| self.canonical(path));
-            classes.push(ClassDefinition {
-                path: self.canonical(path),
-                parent,
-            });
+            let parent = self.resolve(self.exports[index].parent, 0)?;
+            classes.push(ClassDefinition { path, parent });
         }
         Ok(classes)
     }
@@ -362,16 +357,14 @@ impl Package {
             let class = self
                 .resolve(object.class, 0)?
                 .ok_or("Export class missing")?;
-            let class_name = self.canonical(class);
+            let class_name = class;
             if !crate::rules::is_candidate(&class_name, graph) {
                 continue;
             }
             let path = self
                 .resolve(index as i32 + 1, 0)?
                 .ok_or("Export path missing")?;
-            let archetype = self
-                .resolve(object.archetype, 0)?
-                .map(|path| self.canonical(path));
+            let archetype = self.resolve(object.archetype, 0)?;
             let (properties, property_error) = match self.properties(&object) {
                 Ok(properties) => (properties, None),
                 Err(error) => (BTreeMap::new(), Some(error)),
@@ -393,6 +386,19 @@ impl Package {
     /// of cached classification. UE object names compare without ASCII case;
     /// prefixes, suffixes, and alternate outer paths are never accepted.
     pub fn inspect_export(&mut self, requested_path: &str) -> Result<ExportRecord, String> {
+        self.inspect_record(requested_path, true)
+    }
+
+    /// Asset leaves need table identity only, not their opaque serialized payload.
+    pub fn inspect_identity(&mut self, requested_path: &str) -> Result<ExportRecord, String> {
+        self.inspect_record(requested_path, false)
+    }
+
+    fn inspect_record(
+        &mut self,
+        requested_path: &str,
+        properties: bool,
+    ) -> Result<ExportRecord, String> {
         if requested_path.is_empty() || requested_path.len() > 8192 {
             return Err("Selected export path is empty or oversized".into());
         }
@@ -422,11 +428,13 @@ impl Package {
         let class = self
             .resolve(object.class, 0)?
             .ok_or("Selected export class is missing")?;
-        let class_name = self.canonical(class);
-        let archetype = self
-            .resolve(object.archetype, 0)?
-            .map(|path| self.canonical(path));
-        let (properties, property_error) = match self.properties(&object) {
+        let class_name = class;
+        let archetype = self.resolve(object.archetype, 0)?;
+        let (properties, property_error) = match if properties {
+            self.properties(&object)
+        } else {
+            Ok(BTreeMap::new())
+        } {
             Ok(properties) => (properties, None),
             Err(error) => (BTreeMap::new(), Some(error)),
         };
@@ -444,6 +452,42 @@ impl Package {
     fn properties(&mut self, object: &Object) -> Result<BTreeMap<String, Value>, String> {
         let data = self.read(object.offset, object.offset + object.size, MAX_EXPORT_DATA)?;
         let mut position = 4;
+        // These reviewed component classes serialize TemplateOwnerClass before
+        // NetIndex. Subobjects inside a class default additionally carry an FName.
+        // A class-default object itself uses UObject's ordinary prefix.
+        let class = self.resolve(object.class, 0)?;
+        if object.flags & 0x200 == 0
+            && matches!(
+                class.as_deref(),
+                Some(
+                    "Engine.SkeletalMeshComponent"
+                        | "Engine.StaticMeshComponent"
+                        | "Engine.ParticleSystemComponent"
+                )
+            )
+        {
+            self.resolve(i32_at(&data, 0)?, 0)?;
+            position = 8;
+            let mut outer = object.outer;
+            for depth in 0..128 {
+                if outer <= 0 {
+                    break;
+                }
+                let parent = self
+                    .exports
+                    .get(outer as usize - 1)
+                    .ok_or("Invalid component outer")?;
+                if parent.flags & 0x200 != 0 {
+                    self.fname(&data, 4)?;
+                    position = 16;
+                    break;
+                }
+                outer = parent.outer;
+                if depth == 127 {
+                    return Err("Component outer cycle/limit".into());
+                }
+            }
+        }
         let mut properties = BTreeMap::new();
         for _ in 0..65536 {
             let name = self.fname(&data, position)?;
@@ -477,10 +521,9 @@ impl Package {
                 match kind.as_str() {
                     "ByteProperty" if size == 8 => Some(json!(self.fname(raw, 0)?)),
                     "ByteProperty" if size == 1 => Some(json!(raw[0])),
-                    "ObjectProperty" if size == 4 => Some(json!(
-                        self.resolve(i32_at(raw, 0)?, 0)?
-                            .map(|path| self.canonical(path))
-                    )),
+                    "ObjectProperty" | "ComponentProperty" if size == 4 => {
+                        Some(json!(self.resolve(i32_at(raw, 0)?, 0)?))
+                    }
                     "IntProperty" if size == 4 => Some(json!(i32_at(raw, 0)?)),
                     "FloatProperty" if size == 4 => {
                         let number = f32::from_bits(u32_at(raw, 0)?);
@@ -505,15 +548,14 @@ impl Package {
                         }
                         let mut values = Vec::with_capacity(count);
                         for index in 0..count {
-                            values.push(
-                                self.resolve(i32_at(raw, 4 + index * 4)?, 0)?
-                                    .map(|path| self.canonical(path)),
-                            );
+                            values.push(self.resolve(i32_at(raw, 4 + index * 4)?, 0)?);
                         }
                         Some(json!(values))
                     }
-                    "ByteProperty" | "ObjectProperty" | "IntProperty" | "FloatProperty"
-                    | "NameProperty" => return Err(format!("Unexpected {kind} length")),
+                    "ByteProperty" | "ObjectProperty" | "ComponentProperty" | "IntProperty"
+                    | "FloatProperty" | "NameProperty" => {
+                        return Err(format!("Unexpected {kind} length"));
+                    }
                     _ => None,
                 }
             };
@@ -817,14 +859,22 @@ pub(crate) mod tests {
         let plain = fixture("MissionPickup", "Unreviewed", "MissionActor", false);
         for bytes in [plain.clone(), compressed_fixture(&plain)] {
             let fixture = DiskFixture::new(&bytes);
+            let stem = fixture.0.file_stem().unwrap().to_str().unwrap();
             let mut memory = Package::open(&fixture.0).unwrap();
             let mut streamed = Package::open_streamed(&fixture.0).unwrap();
             assert!(memory.bytes().is_some());
             assert!(streamed.bytes().is_none());
             assert_eq!(memory.classes().unwrap(), streamed.classes().unwrap());
             assert_eq!(
-                memory.inspect_export("MissionPickup").unwrap(),
-                streamed.inspect_export("MissionPickup").unwrap()
+                memory
+                    .inspect_export(&format!("{stem}.MissionPickup"))
+                    .unwrap(),
+                streamed
+                    .inspect_export(&format!(
+                        "{}.MissionPickup",
+                        fixture.0.file_stem().unwrap().to_str().unwrap()
+                    ))
+                    .unwrap()
             );
             assert!(
                 streamed.paths.len() <= 4,
@@ -843,7 +893,12 @@ pub(crate) mod tests {
             .open(&fixture.0)
             .unwrap();
         writer.set_len((plain.len() - 4) as u64).unwrap();
-        let selected = streamed.inspect_export("MissionPickup").unwrap();
+        let selected = streamed
+            .inspect_export(&format!(
+                "{}.MissionPickup",
+                fixture.0.file_stem().unwrap().to_str().unwrap()
+            ))
+            .unwrap();
         assert!(selected.property_error.unwrap().contains("Truncated"));
         assert!(streamed.raw.read(usize::MAX, 1).is_err());
         assert!(streamed.raw.read(0, MAX_TABLE + 1).is_err());
@@ -876,22 +931,119 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn component_prefixes_and_component_properties_are_bounded() {
+        for (class_default, default_outer, prefix) in
+            [(false, false, 8), (true, false, 4), (false, true, 16)]
+        {
+            let mut package = Package::parse(
+                fixture("Mesh", "Engine", "SkeletalMeshComponent", false),
+                "Test",
+            )
+            .unwrap();
+            let mut object = package.exports[0].clone();
+            if class_default {
+                object.flags |= 0x200;
+            }
+            if default_outer {
+                let mut parent = object.clone();
+                parent.name = "Default__Owner".into();
+                parent.flags |= 0x200;
+                package.exports.push(parent);
+                object.outer = 2;
+            }
+            let property = package.names.len() as u32;
+            package
+                .names
+                .extend(["MeshLink".into(), "ComponentProperty".into()]);
+            let mut body = vec![0; prefix];
+            for word in [property, 0, property + 1, 0, 4, 0, 0, 0, 0] {
+                body.extend_from_slice(&word.to_le_bytes());
+            }
+            let Input::Memory(bytes) = &mut package.raw else {
+                panic!("memory fixture")
+            };
+            object.offset = bytes.len();
+            object.size = body.len();
+            bytes.extend(body);
+            package.logical_size = bytes.len();
+            let values = package.properties(&object).unwrap();
+            assert_eq!(values.get("MeshLink"), Some(&Value::Null));
+            object.size = prefix + 3;
+            assert!(package.properties(&object).is_err());
+        }
+    }
+
+    #[test]
+    fn ordinary_roots_and_nested_exports_keep_source_package_identity() {
+        for root in ["MapA", "MapB"] {
+            let mut package =
+                Package::parse(fixture("Weapon", "Core", "Object", false), root).unwrap();
+            let mut component = package.exports[0].clone();
+            component.outer = 1;
+            component.name = "Mesh".into();
+            package.exports.push(component);
+            assert_eq!(
+                package.resolve(1, 0).unwrap().unwrap(),
+                format!("{root}.Weapon")
+            );
+            assert_eq!(
+                package.resolve(2, 0).unwrap().unwrap(),
+                format!("{root}.Weapon.Mesh")
+            );
+            assert_eq!(package.resolve(-1, 0).unwrap().as_deref(), Some("Core"));
+            assert_eq!(
+                package.resolve(-2, 0).unwrap().as_deref(),
+                Some("Core.Object")
+            );
+        }
+    }
+
+    #[test]
+    fn forced_export_roots_preserve_cooked_logical_names() {
+        let mut bytes = fixture("LogicalPackage", "Core", "Package", false);
+        let export = u32_at(&bytes, 37).unwrap() as usize;
+        bytes[export + 40..export + 44].copy_from_slice(&1_u32.to_le_bytes());
+        let mut package = Package::parse(bytes, "Startup_INT").unwrap();
+        let mut child = package.exports[0].clone();
+        child.outer = 1;
+        child.name = "Item".into();
+        package.exports.push(child);
+        assert_eq!(
+            package.resolve(1, 0).unwrap().as_deref(),
+            Some("LogicalPackage")
+        );
+        assert_eq!(
+            package.resolve(2, 0).unwrap().as_deref(),
+            Some("LogicalPackage.Item")
+        );
+    }
+
+    #[test]
     fn selected_export_reads_actual_unknown_class_and_rejects_other_paths() {
         let bytes = fixture("MissionPickup", "Unreviewed", "MissionActor", false);
         let mut package = Package::parse(bytes, "Items").unwrap();
         assert!(package.candidates(&BTreeMap::new()).unwrap().is_empty());
-        let selected = package.inspect_export("MissionPickup").unwrap();
+        let selected = package.inspect_export("Items.MissionPickup").unwrap();
         assert_eq!(selected.class_name, "Unreviewed.MissionActor");
         assert!(selected.is_archetype);
         assert!(selected.property_error.is_none());
-        assert_eq!(package.inspect_export("missionpickup").unwrap(), selected);
-        for path in ["", "Pickup", "Items.MissionPickup", "MissionPickup.Other"] {
+        assert_eq!(
+            package.inspect_export("items.missionpickup").unwrap(),
+            selected
+        );
+        for path in [
+            "",
+            "Pickup",
+            "MissionPickup",
+            "Other.MissionPickup",
+            "Items.MissionPickup.Other",
+        ] {
             assert!(package.inspect_export(path).is_err());
         }
         package.exports.push(package.exports[0].clone());
         assert!(
             package
-                .inspect_export("MissionPickup")
+                .inspect_export("Items.MissionPickup")
                 .unwrap_err()
                 .contains("ambiguous")
         );
@@ -929,6 +1081,7 @@ pub(crate) mod tests {
             parent: 0,
             archetype: 0,
             flags: 0,
+            export_flags: 0,
             offset: 0,
             size: 0,
         });

@@ -74,7 +74,7 @@ struct Job {
     deadline: Instant,
     state: Arc<AtomicU8>,
     response: SyncSender<Response>,
-    catalog: Option<Arc<dd_catalog::CatalogSnapshot>>,
+    catalog: crate::catalog_runtime::Prepared,
 }
 
 impl Job {
@@ -211,7 +211,7 @@ fn dispatch(
     sender: &SyncSender<Job>,
     request: Request,
     budget: Duration,
-    catalog: Option<Arc<dd_catalog::CatalogSnapshot>>,
+    catalog: crate::catalog_runtime::Prepared,
 ) -> Response {
     let id = request.id;
     let attempted = uncertain_spawn(&request);
@@ -410,7 +410,7 @@ mod tests {
             deadline,
             state: Arc::new(AtomicU8::new(QUEUED)),
             response: mpsc::sync_channel(1).0,
-            catalog: None,
+            catalog: Default::default(),
         }
     }
 
